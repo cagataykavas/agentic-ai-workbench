@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Human-Agent Review Cockpit</title>
+  <style>
+    :root{font-family:Inter,system-ui,sans-serif;color:#172033;background:#f4f6f8}*{box-sizing:border-box}body{margin:0}.shell{max-width:1180px;margin:36px auto;padding:0 20px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}.badge{padding:7px 11px;border-radius:999px;background:#e8eef7;font-size:13px}.grid{display:grid;grid-template-columns:1.15fr .85fr;gap:18px}.card{background:white;border:1px solid #dfe4ea;border-radius:16px;padding:20px;box-shadow:0 10px 30px rgba(28,40,60,.06)}.title{font-size:24px;margin:0 0 5px}.muted{color:#687386}.score{font-size:42px;font-weight:800}.row{display:flex;justify-content:space-between;gap:16px;align-items:center}.signal{padding:12px 0;border-bottom:1px solid #edf0f3}.signal:last-child{border-bottom:0}.evidence{font-family:ui-monospace,monospace;font-size:13px;background:#f7f9fb;padding:11px;border-radius:10px;margin-top:9px}.actions{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:18px}.actions button{padding:12px;border-radius:10px;border:1px solid #cfd6df;background:#fff;font-weight:700}.actions .primary{background:#172033;color:white}.metric{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #edf0f3}.timeline{margin-top:18px}.event{border-left:2px solid #d9dfe7;padding:0 0 16px 14px}.event strong{display:block}.notice{padding:14px;border-radius:12px;background:#fff8e7;border:1px solid #f0dfae;margin-bottom:14px}@media(max-width:850px){.grid{grid-template-columns:1fr}.actions{grid-template-columns:1fr}.row{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div><div class="badge">Prototype · Human–Agent Collaboration</div><h1 class="title">Financial Crime Review Cockpit</h1><div class="muted">Case FC-20418 · customer onboarding</div></div>
+      <div class="badge">Queue age 04:32</div>
+    </header>
+
+    <section class="grid">
+      <div>
+        <article class="card">
+          <div class="row"><div><div class="muted">Agent risk assessment</div><div class="score">0.61</div></div><div><strong>Confidence 94%</strong><div class="muted">Human review required by policy</div></div></div>
+          <div class="notice"><strong>Why this reached you</strong><br/>Risk is inside the manual-review band. The agent is not authorized to make the final decision.</div>
+          <div class="signal"><strong>Device changed recently</strong><div class="muted">New device observed 2 hours before application.</div><div class="evidence">evidence: evt-17 · device_history</div></div>
+          <div class="signal"><strong>Transaction velocity elevated</strong><div class="muted">Recent activity is above the customer's historical baseline.</div><div class="evidence">evidence: evt-21 · velocity_24h</div></div>
+          <div class="signal"><strong>Identity evidence consistent</strong><div class="muted">No mismatch detected across supplied identity fields.</div><div class="evidence">evidence: doc-08 · identity_check</div></div>
+          <div class="actions"><button class="primary">Approve</button><button>Request information</button><button>Reject / hold</button></div>
+        </article>
+
+        <article class="card timeline">
+          <h2>Decision timeline</h2>
+          <div class="event"><strong>15:02 · Application submitted</strong><span class="muted">Profile and identity evidence received.</span></div>
+          <div class="event"><strong>15:03 · Agent assessment complete</strong><span class="muted">Risk 0.61 · confidence 0.94.</span></div>
+          <div class="event"><strong>15:03 · Routed to human review</strong><span class="muted">Policy: medium-risk band.</span></div>
+        </article>
+      </div>
+
+      <aside>
+        <article class="card">
+          <h2>Reviewer context</h2>
+          <div class="metric"><span>Customer tenure</span><strong>3.2 years</strong></div>
+          <div class="metric"><span>Previous reviews</span><strong>0</strong></div>
+          <div class="metric"><span>Application completion</span><strong>92%</strong></div>
+          <div class="metric"><span>Agent recommendation</span><strong>Review</strong></div>
+          <div class="metric"><span>Expected SLA</span><strong>&lt; 10 min</strong></div>
+        </article>
+
+        <article class="card" style="margin-top:18px">
+          <h2>Service metrics</h2>
+          <div class="metric"><span>Automation rate</span><strong>51%</strong></div>
+          <div class="metric"><span>Human override rate</span><strong>5.5%</strong></div>
+          <div class="metric"><span>Median review time</span><strong>41 sec</strong></div>
+          <div class="metric"><span>Customer drop-off</span><strong>4.2%</strong></div>
+        </article>
+      </aside>
+    </section>
+  </main>
+</body>
+</html>
