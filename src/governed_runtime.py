@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 
 class RiskLevel(str, Enum):
@@ -134,7 +135,7 @@ class PolicyConfig:
 class ToolPolicy:
     """Make execution authority explicit and independent from the planner.
 
-    A planner may *propose* any registered action. This policy decides whether
+    A planner may propose any registered action. This policy decides whether
     the runtime is allowed to execute it without human approval.
     """
 
