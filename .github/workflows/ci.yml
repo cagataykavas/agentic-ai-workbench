@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install project
+        run: pip install -e '.[dev]'
+      - name: Ruff
+        run: ruff check src tests human_agent_collaboration.py workflow_experiment.py
+      - name: Pytest
+        run: pytest -q
+      - name: Legacy deterministic demo smoke
+        run: python -m src.demo
+      - name: Governed runtime import smoke
+        run: python -c "from src.governed_runtime import GovernedAgentRuntime, ToolRegistry; GovernedAgentRuntime(ToolRegistry())"
