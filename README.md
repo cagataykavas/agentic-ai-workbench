@@ -101,6 +101,31 @@ The trace also records why execution stopped. It can be serialized to plain dict
 
 These metrics are intentionally about **agent workflow behavior**, not LLM eloquence.
 
+## Offline trajectory regression evaluation
+
+`src/trajectory_eval.py` evaluates recorded execution traces without rerunning tools or calling a model. A JSON expectation declares the ordered tool calls, terminal statuses and optional partial output contracts that a known-good trajectory must satisfy.
+
+```json
+{
+  "name": "lookup stays read-only",
+  "steps": [
+    {
+      "tool": "lookup",
+      "status": "succeeded",
+      "output_contains": {"record": {"active": true}}
+    }
+  ]
+}
+```
+
+Run a regression check against a trace produced by `ExecutionTrace.to_dict()`:
+
+```bash
+python -m src.trajectory_eval expectation.json trace.json
+```
+
+The command emits machine-readable results and exits non-zero on tool-order, status, output or step-count drift. The Python API also aggregates multiple cases into suite-level case pass rate and assertion rate. Partial nested output matching keeps contracts stable when traces add unrelated diagnostic fields.
+
 ## Example
 
 ```python
@@ -184,6 +209,7 @@ src/core.py                    original deterministic tool loop
 src/demo.py                    local baseline demo
 src/governed_runtime.py        policy, approvals, idempotency, bounded execution
 src/runtime_eval.py            trace-level operational metrics
+src/trajectory_eval.py         offline trajectory regression harness
 human_agent_collaboration.py   human/agent routing example
 workflow_experiment.py         workflow comparison metrics
 tests/                         executable runtime contracts
@@ -197,7 +223,7 @@ GitHub Actions validates the full public engineering surface:
 - policy/approval behavior;
 - idempotent replay;
 - execution budget handling;
-- trace evaluation;
+- trace and offline trajectory regression evaluation;
 - deterministic demo smoke test;
 - packaged runtime import.
 
@@ -220,7 +246,6 @@ No external model API is required for CI.
 - retry budgets and circuit breakers;
 - OpenTelemetry spans;
 - planner adapters for OpenAI-compatible models;
-- offline agent trajectory evaluation and replay.
 
 ## Interview topics
 
