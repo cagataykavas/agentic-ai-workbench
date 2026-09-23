@@ -7,6 +7,13 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
+from src.tool_result_admission import (
+    AdmittedToolResult,
+    ToolResultPolicy,
+    ToolResultRejected,
+    admit_tool_result,
+)
+
 
 class RiskLevel(str, Enum):
     LOW = "low"
@@ -49,6 +56,7 @@ class ToolSpec:
     side_effect: SideEffect = SideEffect.NONE
     idempotent: bool = True
     validator: Validator | None = None
+    result_policy: ToolResultPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +83,9 @@ class ActionResult:
     error: str | None
     policy: PolicyResult
     idempotency_key: str
+    output_sha256: str | None = None
+    output_bytes: int | None = None
+    error_code: str | None = None
 
 
 @dataclass
@@ -172,14 +183,20 @@ class ExecutionLedger:
     """Store successful idempotent outcomes to suppress duplicate side effects."""
 
     def __init__(self) -> None:
-        self._successful: dict[str, Payload] = {}
+        self._successful: dict[str, AdmittedToolResult] = {}
 
     def get(self, key: str) -> Payload | None:
-        value = self._successful.get(key)
-        return dict(value) if value is not None else None
+        admitted = self._successful.get(key)
+        return admitted.payload if admitted is not None else None
+
+    def get_admitted(self, key: str) -> AdmittedToolResult | None:
+        return self._successful.get(key)
 
     def record(self, key: str, output: Payload) -> None:
-        self._successful[key] = dict(output)
+        self._successful[key] = admit_tool_result(output, tool="ledger")
+
+    def record_admitted(self, key: str, output: AdmittedToolResult) -> None:
+        self._successful[key] = output
 
 
 class GovernedAgentRuntime:
@@ -189,6 +206,7 @@ class GovernedAgentRuntime:
         *,
         policy: ToolPolicy | None = None,
         ledger: ExecutionLedger | None = None,
+        result_policy: ToolResultPolicy | None = None,
         max_steps: int = 8,
     ) -> None:
         if max_steps < 1:
@@ -196,6 +214,7 @@ class GovernedAgentRuntime:
         self.registry = registry
         self.policy = policy or ToolPolicy()
         self.ledger = ledger or ExecutionLedger()
+        self.result_policy = result_policy or ToolResultPolicy()
         self.max_steps = max_steps
 
     @staticmethod
@@ -285,17 +304,40 @@ class GovernedAgentRuntime:
                 )
                 continue
 
-            cached = self.ledger.get(key) if tool.idempotent else None
+            effective_result_policy = tool.result_policy or self.result_policy
+            cached = self.ledger.get_admitted(key) if tool.idempotent else None
             if cached is not None:
+                try:
+                    admitted = admit_tool_result(
+                        cached.payload,
+                        tool=tool.name,
+                        policy=effective_result_policy,
+                    )
+                except ToolResultRejected as exc:
+                    trace.results.append(
+                        ActionResult(
+                            action.action_id,
+                            action.tool,
+                            ActionStatus.FAILED,
+                            None,
+                            f"ToolResultRejected: {exc}",
+                            policy_result,
+                            key,
+                            error_code=exc.code,
+                        )
+                    )
+                    continue
                 trace.results.append(
                     ActionResult(
                         action.action_id,
                         action.tool,
                         ActionStatus.REPLAYED,
-                        cached,
+                        admitted.payload,
                         None,
                         policy_result,
                         key,
+                        output_sha256=admitted.sha256,
+                        output_bytes=admitted.serialized_bytes,
                     )
                 )
                 continue
@@ -304,8 +346,25 @@ class GovernedAgentRuntime:
                 if tool.validator:
                     tool.validator(action.arguments)
                 output = tool.handler(dict(action.arguments))
-                if not isinstance(output, dict):
-                    raise TypeError("tool handlers must return dictionaries")
+                admitted = admit_tool_result(
+                    output,
+                    tool=tool.name,
+                    policy=effective_result_policy,
+                )
+            except ToolResultRejected as exc:
+                trace.results.append(
+                    ActionResult(
+                        action.action_id,
+                        action.tool,
+                        ActionStatus.FAILED,
+                        None,
+                        f"ToolResultRejected: {exc}",
+                        policy_result,
+                        key,
+                        error_code=exc.code,
+                    )
+                )
+                continue
             except (TypeError, ValueError, RuntimeError, OSError) as exc:
                 trace.results.append(
                     ActionResult(
@@ -321,16 +380,18 @@ class GovernedAgentRuntime:
                 continue
 
             if tool.idempotent:
-                self.ledger.record(key, output)
+                self.ledger.record_admitted(key, admitted)
             trace.results.append(
                 ActionResult(
                     action.action_id,
                     action.tool,
                     ActionStatus.SUCCEEDED,
-                    output,
+                    admitted.payload,
                     None,
                     policy_result,
                     key,
+                    output_sha256=admitted.sha256,
+                    output_bytes=admitted.serialized_bytes,
                 )
             )
 
