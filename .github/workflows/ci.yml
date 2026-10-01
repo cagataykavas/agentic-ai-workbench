@@ -17,8 +17,12 @@ jobs:
         run: pip install -e '.[dev]'
       - name: Ruff
         run: ruff check src tests human_agent_collaboration.py workflow_experiment.py
+      - name: Format-check instruction provenance boundary
+        run: ruff format --check src/instruction_provenance.py tests/test_instruction_provenance.py
       - name: Pytest
         run: pytest -q
+      - name: Compile Python sources
+        run: python -m compileall -q src tests
       - name: Legacy deterministic demo smoke
         run: python -m src.demo
       - name: Governed runtime import smoke
