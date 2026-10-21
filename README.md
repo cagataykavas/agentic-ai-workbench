@@ -64,7 +64,7 @@ This keeps a human-in-the-loop workflow concrete: approval is represented as exe
 
 ### Idempotent retries
 
-Successful idempotent calls are stored using an explicit or deterministic SHA-256 idempotency key. Repeated requests return `replayed` with the previous output instead of repeating the side effect.
+Successful idempotent calls are stored using an explicit or deterministic SHA-256 idempotency key. The dependency executor additionally binds each key to the canonical tool-and-arguments digest, so a changed request cannot receive a stale replay. Equivalent retries return `replayed` with the previous output instead of repeating the side effect.
 
 This is useful for agent systems because transport retries, duplicated messages and repeated model plans should not automatically duplicate downstream writes.
 
@@ -183,6 +183,7 @@ Those examples are kept separate from the runtime so service-design metrics do n
 src/core.py                    original deterministic tool loop
 src/demo.py                    local baseline demo
 src/governed_runtime.py        policy, approvals, idempotency, bounded execution
+src/dag_execution.py           validated dependency DAG execution
 src/runtime_eval.py            trace-level operational metrics
 human_agent_collaboration.py   human/agent routing example
 workflow_experiment.py         workflow comparison metrics
@@ -196,6 +197,7 @@ GitHub Actions validates the full public engineering surface:
 - Ruff over the runtime, tests and earlier examples;
 - policy/approval behavior;
 - idempotent replay;
+- fail-closed idempotency-key payload binding;
 - execution budget handling;
 - trace evaluation;
 - deterministic demo smoke test;

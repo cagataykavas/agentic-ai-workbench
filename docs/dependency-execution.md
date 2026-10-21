@@ -32,6 +32,9 @@ trace = await DependencyExecutor(registry, max_concurrency=4).execute(
 - Duplicate keys for idempotent actions under the same tool contract are rejected before parallel
   dispatch, closing the race in which both calls observe an empty ledger and repeat the same side
   effect. Ledger keys are namespaced by tool so one contract cannot replay another tool's result.
+- Each successful ledger entry also binds the key to the canonical tool-and-arguments SHA-256.
+  Reusing a key with changed arguments fails closed before dispatch within one plan and before stale
+  replay across later executions; equivalent JSON objects with reordered keys still replay safely.
 - Arguments are canonicalized and copied at admission, preventing caller mutation after validation.
 - Synchronous handlers run off the event loop; asynchronous handlers are supported directly.
 - Caller cancellation is not reported until the active wave reaches a terminal state, avoiding an
@@ -47,6 +50,8 @@ remote side effect between commit and ledger recording. Production tools need do
 idempotency keys, transport deadlines, authenticated receipts, durable execution state, and the
 reconciliation workflow described elsewhere in this repository. The scheduler also treats declared
 dependencies as policy input; it cannot discover a planner's omitted data or side-effect dependency.
+The payload binding is process-local and does not make the ledger's check/execute/record sequence
+atomic across concurrent executors or replicas.
 
 The next production step is a durable adapter that claims ready DAG nodes transactionally, fences
 workers with leases, and records each terminal result before unlocking children across replicas.

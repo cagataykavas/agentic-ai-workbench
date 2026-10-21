@@ -231,6 +231,104 @@ def test_duplicate_idempotency_key_is_rejected_before_parallel_dispatch() -> Non
     assert calls == 0
 
 
+def test_same_key_with_different_payloads_is_rejected_before_dispatch() -> None:
+    calls = 0
+
+    def handler(_arguments: dict) -> dict:
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    executor = DependencyExecutor(registry_with(write=handler))
+    plan = [
+        DependencyAction("first", "write", {"value": 1}, idempotency_key="request-123"),
+        DependencyAction(
+            "second",
+            "write",
+            {"value": 2},
+            ("first",),
+            "request-123",
+        ),
+    ]
+
+    with pytest.raises(PlanValidationError) as caught:
+        run(executor.execute("payload drift", plan))
+
+    assert caught.value.code == "idempotency_key_payload_mismatch"
+    assert calls == 0
+
+
+def test_key_reuse_with_changed_payload_fails_without_stale_replay() -> None:
+    calls = 0
+
+    def handler(arguments: dict) -> dict:
+        nonlocal calls
+        calls += 1
+        return {"saved": arguments["value"]}
+
+    executor = DependencyExecutor(registry_with(write=handler))
+    first = run(
+        executor.execute(
+            "first request",
+            [DependencyAction("first", "write", {"value": 1}, idempotency_key="request-123")],
+        )
+    )
+    changed = run(
+        executor.execute(
+            "changed request",
+            [DependencyAction("second", "write", {"value": 2}, idempotency_key="request-123")],
+        )
+    )
+
+    assert first.results[0].status is DagActionStatus.SUCCEEDED
+    assert changed.results[0].status is DagActionStatus.FAILED
+    assert changed.results[0].error_code == "idempotency_key_payload_mismatch"
+    assert changed.results[0].output is None
+    assert calls == 1
+
+
+def test_key_reuse_accepts_equivalent_canonical_payload() -> None:
+    calls = 0
+
+    def handler(arguments: dict) -> dict:
+        nonlocal calls
+        calls += 1
+        return {"saved": arguments}
+
+    executor = DependencyExecutor(registry_with(write=handler))
+    first = run(
+        executor.execute(
+            "first request",
+            [
+                DependencyAction(
+                    "first",
+                    "write",
+                    {"left": 1, "right": 2},
+                    idempotency_key="request-123",
+                )
+            ],
+        )
+    )
+    retry = run(
+        executor.execute(
+            "equivalent retry",
+            [
+                DependencyAction(
+                    "retry",
+                    "write",
+                    {"right": 2, "left": 1},
+                    idempotency_key="request-123",
+                )
+            ],
+        )
+    )
+
+    assert first.results[0].status is DagActionStatus.SUCCEEDED
+    assert retry.results[0].status is DagActionStatus.REPLAYED
+    assert retry.results[0].output == {"saved": {"left": 1, "right": 2}}
+    assert calls == 1
+
+
 def test_same_explicit_key_is_scoped_to_each_tool_contract_across_runs() -> None:
     calls: list[str] = []
 

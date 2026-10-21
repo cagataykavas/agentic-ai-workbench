@@ -13,6 +13,7 @@ from typing import Any, cast
 from src.governed_runtime import (
     Decision,
     ExecutionLedger,
+    IdempotencyPayloadMismatchError,
     PolicyResult,
     ToolPolicy,
     ToolRegistry,
@@ -105,6 +106,7 @@ class _PreparedAction:
     arguments: dict[str, Any]
     depends_on: tuple[str, ...]
     idempotency_key: str
+    request_sha256: str
 
 
 def _canonical_json(value: object) -> bytes:
@@ -206,12 +208,14 @@ class DependencyExecutor:
             else:
                 raw_key = _sha256(_canonical_json({"tool": action.tool, "arguments": arguments}))
             key = f"{action.tool}:{raw_key}"
+            request_sha256 = _sha256(_canonical_json({"tool": action.tool, "arguments": arguments}))
             candidate = _PreparedAction(
                 action_id=action.action_id,
                 tool=tool,
                 arguments=arguments,
                 depends_on=action.depends_on,
                 idempotency_key=key,
+                request_sha256=request_sha256,
             )
             prepared.append(candidate)
             if tool.idempotent:
@@ -255,6 +259,8 @@ class DependencyExecutor:
                         reaches(left.action_id, right.action_id) or reaches(right.action_id, left.action_id)
                     ):
                         raise PlanValidationError("duplicate_idempotency_key")
+            if len({owner.request_sha256 for owner in owners}) != 1:
+                raise PlanValidationError("idempotency_key_payload_mismatch")
 
         plan_projection = [
             {
@@ -312,7 +318,22 @@ class DependencyExecutor:
                 key_digest,
             )
 
-        cached = self.ledger.get(action.idempotency_key) if action.tool.idempotent else None
+        try:
+            cached = (
+                self.ledger.get_for_request(action.idempotency_key, action.request_sha256)
+                if action.tool.idempotent
+                else None
+            )
+        except IdempotencyPayloadMismatchError:
+            return DagActionResult(
+                action.action_id,
+                action.tool.name,
+                DagActionStatus.FAILED,
+                None,
+                "idempotency_key_payload_mismatch",
+                policy_result,
+                key_digest,
+            )
         if cached is not None:
             return DagActionResult(
                 action.action_id,
@@ -338,7 +359,22 @@ class DependencyExecutor:
                 key_digest,
             )
         if action.tool.idempotent:
-            self.ledger.record(action.idempotency_key, output)
+            try:
+                self.ledger.record_for_request(
+                    action.idempotency_key,
+                    action.request_sha256,
+                    output,
+                )
+            except IdempotencyPayloadMismatchError:
+                return DagActionResult(
+                    action.action_id,
+                    action.tool.name,
+                    DagActionStatus.FAILED,
+                    None,
+                    "idempotency_commit_conflict",
+                    policy_result,
+                    key_digest,
+                )
         return DagActionResult(
             action.action_id,
             action.tool.name,
