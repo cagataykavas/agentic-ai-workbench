@@ -19,6 +19,22 @@ trace = await DependencyExecutor(registry, max_concurrency=4).execute(
 )
 ```
 
+For restart-safe replay on one host, inject the standard-library SQLite adapter:
+
+```python
+from src.sqlite_ledger import SQLiteExecutionLedger
+
+executor = DependencyExecutor(
+    registry,
+    ledger=SQLiteExecutionLedger("execution-ledger.db"),
+)
+```
+
+The adapter stores canonical JSON outputs, preserves the first terminal result for a request, and
+uses an immediate transaction to serialize competing commits. A replacement process opening the
+same database therefore replays the prior success or rejects a changed request digest without
+calling the tool again.
+
 ## Guarantees
 
 - The complete graph, tool catalog, JSON argument snapshot, identifiers, dependency budgets, and
@@ -44,14 +60,15 @@ trace = await DependencyExecutor(registry, max_concurrency=4).execute(
 
 ## Operational boundary
 
-This scheduler is in-process. Its ledger and concurrency limit are not shared across replicas, and
-waiting for a synchronous thread does not stop that thread. A crashed process can still strand a
-remote side effect between commit and ledger recording. Production tools need downstream
-idempotency keys, transport deadlines, authenticated receipts, durable execution state, and the
-reconciliation workflow described elsewhere in this repository. The scheduler also treats declared
-dependencies as policy input; it cannot discover a planner's omitted data or side-effect dependency.
-The payload binding is process-local and does not make the ledger's check/execute/record sequence
-atomic across concurrent executors or replicas.
+This scheduler and its concurrency limit are in-process. `SQLiteExecutionLedger` makes terminal
+results durable and coordinates commits through a shared local database, but it does not make the
+ledger-check, remote side effect, and ledger-record sequence one atomic operation. A crash can still
+strand a remote side effect between its commit and the local record; two workers can also both pass
+an empty-ledger check before either records a result. Production tools therefore still need
+downstream idempotency keys, transport deadlines, authenticated receipts, and reconciliation. The
+scheduler also treats declared dependencies as policy input; it cannot discover a planner's omitted
+data or side-effect dependency.
 
-The next production step is a durable adapter that claims ready DAG nodes transactionally, fences
-workers with leases, and records each terminal result before unlocking children across replicas.
+The next production step is a claim/lease protocol that fences workers before dispatch and records
+each terminal result before unlocking children across replicas. SQLite is a single-host reference
+adapter, not a distributed coordinator.
