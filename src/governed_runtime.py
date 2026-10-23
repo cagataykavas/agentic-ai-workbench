@@ -173,6 +173,7 @@ class ExecutionLedger:
 
     def __init__(self) -> None:
         self._successful: dict[str, Payload] = {}
+        self._request_sha256: dict[str, str] = {}
 
     def get(self, key: str) -> Payload | None:
         value = self._successful.get(key)
@@ -180,6 +181,26 @@ class ExecutionLedger:
 
     def record(self, key: str, output: Payload) -> None:
         self._successful[key] = dict(output)
+
+    def get_for_request(self, key: str, request_sha256: str) -> Payload | None:
+        """Return a replay only when the key still identifies the same request."""
+        value = self._successful.get(key)
+        if value is None:
+            return None
+        if self._request_sha256.get(key) != request_sha256:
+            raise IdempotencyPayloadMismatchError
+        return dict(value)
+
+    def record_for_request(self, key: str, request_sha256: str, output: Payload) -> None:
+        """Bind an idempotency key to one canonical request before storing output."""
+        if key in self._successful and self._request_sha256.get(key) != request_sha256:
+            raise IdempotencyPayloadMismatchError
+        self._request_sha256[key] = request_sha256
+        self._successful[key] = dict(output)
+
+
+class IdempotencyPayloadMismatchError(ValueError):
+    """An idempotency key was reused for a different canonical request."""
 
 
 class GovernedAgentRuntime:

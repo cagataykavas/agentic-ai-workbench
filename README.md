@@ -64,7 +64,14 @@ This keeps a human-in-the-loop workflow concrete: approval is represented as exe
 
 ### Idempotent retries
 
-Successful idempotent calls are stored using an explicit or deterministic SHA-256 idempotency key. Repeated requests return `replayed` with the previous output instead of repeating the side effect.
+Successful idempotent calls are stored using an explicit or deterministic SHA-256 idempotency key. The dependency executor additionally binds each key to the canonical tool-and-arguments digest, so a changed request cannot receive a stale replay. Equivalent retries return `replayed` with the previous output instead of repeating the side effect. An optional standard-library SQLite ledger preserves these decisions across process restarts while keeping the in-memory default convenient for tests.
+
+The SQLite adapter also claims new work before tool dispatch. One worker receives a monotonically
+increasing fencing token; competitors fail closed without invoking the handler. Handlers can read
+`get_current_fencing_token()` and forward the value to a dependency that supports conditional
+writes. Expired leases and post-dispatch failures become `unknown` rather than being retried
+optimistically. Recovery therefore requires either a trusted external success receipt or an
+explicit authorization to retry with the next fencing token.
 
 This is useful for agent systems because transport retries, duplicated messages and repeated model plans should not automatically duplicate downstream writes.
 
@@ -183,6 +190,8 @@ Those examples are kept separate from the runtime so service-design metrics do n
 src/core.py                    original deterministic tool loop
 src/demo.py                    local baseline demo
 src/governed_runtime.py        policy, approvals, idempotency, bounded execution
+src/dag_execution.py           validated dependency DAG execution
+src/sqlite_ledger.py            restart-safe SQLite idempotency adapter
 src/runtime_eval.py            trace-level operational metrics
 human_agent_collaboration.py   human/agent routing example
 workflow_experiment.py         workflow comparison metrics
@@ -196,6 +205,9 @@ GitHub Actions validates the full public engineering surface:
 - Ruff over the runtime, tests and earlier examples;
 - policy/approval behavior;
 - idempotent replay;
+- fail-closed idempotency-key payload binding;
+- restart-safe SQLite replay and concurrent terminal-result protection;
+- 64-worker claim contention, fencing-token rotation and unknown-outcome reconciliation;
 - execution budget handling;
 - trace evaluation;
 - deterministic demo smoke test;
