@@ -17,6 +17,7 @@ from src.governed_runtime import (
     IdempotencyPayloadMismatchError,
     Payload,
 )
+from src.reconciliation import ReceiptAuthenticator, ReconciliationReceipt
 
 
 class LedgerCorruptionError(RuntimeError):
@@ -510,3 +511,18 @@ class SQLiteExecutionLedger(ExecutionLedger):
                 (key, expected_fencing_token),
             )
             connection.commit()
+
+    def record_authenticated_reconciled_success(
+        self,
+        receipt: ReconciliationReceipt,
+        authenticator: ReceiptAuthenticator,
+    ) -> None:
+        """Consume one authentic receipt for the exact unknown claim without redispatch."""
+
+        output = authenticator.verify(receipt)
+        self.record_reconciled_success(
+            receipt.key,
+            receipt.request_sha256,
+            receipt.fencing_token,
+            output,
+        )
