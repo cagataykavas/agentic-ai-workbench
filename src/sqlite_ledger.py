@@ -3,9 +3,14 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sqlite3
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from src.governed_runtime import (
     ExecutionLedger,
@@ -16,6 +21,52 @@ from src.governed_runtime import (
 
 class LedgerCorruptionError(RuntimeError):
     """A persisted ledger row cannot be decoded as the promised payload type."""
+
+
+class StaleFencingTokenError(RuntimeError):
+    """A worker no longer owns the claim it is trying to mutate."""
+
+
+class ClaimDisposition(StrEnum):
+    ACQUIRED = "acquired"
+    REPLAYED = "replayed"
+    BUSY = "busy"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionClaim:
+    disposition: ClaimDisposition
+    fencing_token: int | None = None
+    lease_expires_at_ms: int | None = None
+    output: Payload | None = None
+
+
+@runtime_checkable
+class ClaimingExecutionLedger(Protocol):
+    def claim_for_request(
+        self,
+        key: str,
+        request_sha256: str,
+        *,
+        lease_seconds: float,
+    ) -> ExecutionClaim: ...
+
+    def complete_claim(
+        self,
+        key: str,
+        request_sha256: str,
+        fencing_token: int,
+        output: Payload,
+    ) -> None: ...
+
+    def abandon_claim(self, key: str, request_sha256: str, fencing_token: int) -> None: ...
+
+    def mark_claim_unknown(self, key: str, request_sha256: str, fencing_token: int) -> None: ...
+
+
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_MAX_LEASE_SECONDS = 3_600.0
 
 
 class SQLiteExecutionLedger(ExecutionLedger):
@@ -31,6 +82,7 @@ class SQLiteExecutionLedger(ExecutionLedger):
         database: str | os.PathLike[str],
         *,
         timeout_seconds: float = 5.0,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
@@ -38,6 +90,7 @@ class SQLiteExecutionLedger(ExecutionLedger):
             raise ValueError("SQLiteExecutionLedger requires a file-backed database")
         self.database = Path(database)
         self.timeout_seconds = timeout_seconds
+        self._clock = clock
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -63,6 +116,42 @@ class SQLiteExecutionLedger(ExecutionLedger):
                 ) STRICT
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS execution_claims (
+                    key TEXT PRIMARY KEY,
+                    request_sha256 TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+                    lease_expires_at_ms INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('running', 'unknown')),
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                ) STRICT
+                """
+            )
+
+    @staticmethod
+    def _validate_claim_identity(key: str, request_sha256: str) -> None:
+        if not isinstance(key, str) or not key or len(key.encode("utf-8")) > 512:
+            raise ValueError("claim key must be 1-512 UTF-8 bytes")
+        if not isinstance(request_sha256, str) or not _SHA256_PATTERN.fullmatch(request_sha256):
+            raise ValueError("request_sha256 must be a lowercase SHA-256 digest")
+
+    @staticmethod
+    def _validate_fencing_token(fencing_token: int, *, may_increment: bool = False) -> None:
+        maximum = 9_223_372_036_854_775_806 if may_increment else 9_223_372_036_854_775_807
+        if type(fencing_token) is not int or not 0 < fencing_token <= maximum:
+            raise ValueError("fencing_token must be a positive SQLite integer")
+
+    def _lease_expiry_ms(self, lease_seconds: float) -> tuple[int, int]:
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, (int, float))
+            or not math.isfinite(lease_seconds)
+            or not 0 < lease_seconds <= _MAX_LEASE_SECONDS
+        ):
+            raise ValueError("lease_seconds must be finite and in (0, 3600]")
+        now_ms = math.floor(self._clock() * 1_000)
+        return now_ms, now_ms + max(1, math.floor(lease_seconds * 1_000))
 
     @staticmethod
     def _encode(output: Payload) -> str:
@@ -103,6 +192,12 @@ class SQLiteExecutionLedger(ExecutionLedger):
         encoded = self._encode(output)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM execution_claims WHERE key = ?",
+                (key,),
+            ).fetchone():
+                connection.rollback()
+                raise StaleFencingTokenError("active claim requires fenced completion")
             connection.execute(
                 """
                 INSERT INTO execution_ledger (key, output_json)
@@ -128,6 +223,12 @@ class SQLiteExecutionLedger(ExecutionLedger):
         encoded = self._encode(output)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM execution_claims WHERE key = ?",
+                (key,),
+            ).fetchone():
+                connection.rollback()
+                raise StaleFencingTokenError("active claim requires fenced completion")
             row = connection.execute(
                 """
                 SELECT request_sha256
@@ -148,5 +249,264 @@ class SQLiteExecutionLedger(ExecutionLedger):
                 VALUES (?, ?, ?)
                 """,
                 (key, request_sha256, encoded),
+            )
+            connection.commit()
+
+    def claim_for_request(
+        self,
+        key: str,
+        request_sha256: str,
+        *,
+        lease_seconds: float,
+    ) -> ExecutionClaim:
+        """Acquire one execution fence or return replay/busy/unknown without dispatch."""
+
+        self._validate_claim_identity(key, request_sha256)
+        now_ms, expires_at_ms = self._lease_expiry_ms(lease_seconds)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            terminal = connection.execute(
+                "SELECT request_sha256, output_json FROM execution_ledger WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if terminal is not None:
+                if terminal["request_sha256"] != request_sha256:
+                    connection.rollback()
+                    raise IdempotencyPayloadMismatchError
+                output = self._decode(terminal["output_json"])
+                connection.commit()
+                return ExecutionClaim(ClaimDisposition.REPLAYED, output=output)
+
+            claim = connection.execute(
+                """
+                SELECT request_sha256, fencing_token, lease_expires_at_ms, state
+                FROM execution_claims
+                WHERE key = ?
+                """,
+                (key,),
+            ).fetchone()
+            if claim is None:
+                connection.execute(
+                    """
+                    INSERT INTO execution_claims (
+                        key, request_sha256, fencing_token, lease_expires_at_ms, state
+                    ) VALUES (?, ?, 1, ?, 'running')
+                    """,
+                    (key, request_sha256, expires_at_ms),
+                )
+                connection.commit()
+                return ExecutionClaim(ClaimDisposition.ACQUIRED, 1, expires_at_ms)
+            if claim["request_sha256"] != request_sha256:
+                connection.rollback()
+                raise IdempotencyPayloadMismatchError
+
+            fencing_token = int(claim["fencing_token"])
+            lease_expires_at_ms = int(claim["lease_expires_at_ms"])
+            if claim["state"] == "unknown" or lease_expires_at_ms <= now_ms:
+                if claim["state"] != "unknown":
+                    connection.execute(
+                        """
+                        UPDATE execution_claims
+                        SET state = 'unknown', updated_at = CURRENT_TIMESTAMP
+                        WHERE key = ? AND fencing_token = ?
+                        """,
+                        (key, fencing_token),
+                    )
+                connection.commit()
+                return ExecutionClaim(
+                    ClaimDisposition.UNKNOWN,
+                    fencing_token,
+                    lease_expires_at_ms,
+                )
+            connection.commit()
+            return ExecutionClaim(
+                ClaimDisposition.BUSY,
+                fencing_token,
+                lease_expires_at_ms,
+            )
+
+    def _owned_running_claim(
+        self,
+        connection: sqlite3.Connection,
+        key: str,
+        request_sha256: str,
+        fencing_token: int,
+    ) -> sqlite3.Row:
+        claim = connection.execute(
+            """
+            SELECT request_sha256, fencing_token, lease_expires_at_ms, state
+            FROM execution_claims
+            WHERE key = ?
+            """,
+            (key,),
+        ).fetchone()
+        if (
+            claim is None
+            or claim["request_sha256"] != request_sha256
+            or claim["fencing_token"] != fencing_token
+            or claim["state"] != "running"
+        ):
+            raise StaleFencingTokenError("claim ownership was lost")
+        return claim
+
+    def complete_claim(
+        self,
+        key: str,
+        request_sha256: str,
+        fencing_token: int,
+        output: Payload,
+    ) -> None:
+        self._validate_claim_identity(key, request_sha256)
+        self._validate_fencing_token(fencing_token)
+        encoded = self._encode(output)
+        now_ms = math.floor(self._clock() * 1_000)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            claim = self._owned_running_claim(
+                connection,
+                key,
+                request_sha256,
+                fencing_token,
+            )
+            if int(claim["lease_expires_at_ms"]) <= now_ms:
+                connection.execute(
+                    """
+                    UPDATE execution_claims
+                    SET state = 'unknown', updated_at = CURRENT_TIMESTAMP
+                    WHERE key = ? AND fencing_token = ?
+                    """,
+                    (key, fencing_token),
+                )
+                connection.commit()
+                raise StaleFencingTokenError("claim lease expired before completion")
+            connection.execute(
+                """
+                INSERT INTO execution_ledger (key, request_sha256, output_json)
+                VALUES (?, ?, ?)
+                """,
+                (key, request_sha256, encoded),
+            )
+            connection.execute(
+                "DELETE FROM execution_claims WHERE key = ? AND fencing_token = ?",
+                (key, fencing_token),
+            )
+            connection.commit()
+
+    def abandon_claim(self, key: str, request_sha256: str, fencing_token: int) -> None:
+        """Release a claim only when validation failed before the handler started."""
+
+        self._validate_claim_identity(key, request_sha256)
+        self._validate_fencing_token(fencing_token)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._owned_running_claim(connection, key, request_sha256, fencing_token)
+            connection.execute(
+                "DELETE FROM execution_claims WHERE key = ? AND fencing_token = ?",
+                (key, fencing_token),
+            )
+            connection.commit()
+
+    def mark_claim_unknown(self, key: str, request_sha256: str, fencing_token: int) -> None:
+        """Block automatic retry when a dispatched handler has no trusted receipt."""
+
+        self._validate_claim_identity(key, request_sha256)
+        self._validate_fencing_token(fencing_token)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._owned_running_claim(connection, key, request_sha256, fencing_token)
+            connection.execute(
+                """
+                UPDATE execution_claims
+                SET state = 'unknown', updated_at = CURRENT_TIMESTAMP
+                WHERE key = ? AND fencing_token = ?
+                """,
+                (key, fencing_token),
+            )
+            connection.commit()
+
+    def retry_unknown_claim(
+        self,
+        key: str,
+        request_sha256: str,
+        expected_fencing_token: int,
+        *,
+        lease_seconds: float,
+    ) -> ExecutionClaim:
+        """Explicitly authorize a retry after reconciliation proved no side effect committed."""
+
+        self._validate_claim_identity(key, request_sha256)
+        self._validate_fencing_token(expected_fencing_token, may_increment=True)
+        _now_ms, expires_at_ms = self._lease_expiry_ms(lease_seconds)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            claim = connection.execute(
+                """
+                SELECT request_sha256, fencing_token, state
+                FROM execution_claims
+                WHERE key = ?
+                """,
+                (key,),
+            ).fetchone()
+            if (
+                claim is None
+                or claim["request_sha256"] != request_sha256
+                or claim["fencing_token"] != expected_fencing_token
+                or claim["state"] != "unknown"
+            ):
+                connection.rollback()
+                raise StaleFencingTokenError("unknown claim changed before retry authorization")
+            next_token = expected_fencing_token + 1
+            connection.execute(
+                """
+                UPDATE execution_claims
+                SET fencing_token = ?, lease_expires_at_ms = ?, state = 'running',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE key = ?
+                """,
+                (next_token, expires_at_ms, key),
+            )
+            connection.commit()
+            return ExecutionClaim(ClaimDisposition.ACQUIRED, next_token, expires_at_ms)
+
+    def record_reconciled_success(
+        self,
+        key: str,
+        request_sha256: str,
+        expected_fencing_token: int,
+        output: Payload,
+    ) -> None:
+        """Persist a trusted external receipt for an unknown outcome without redispatch."""
+
+        self._validate_claim_identity(key, request_sha256)
+        self._validate_fencing_token(expected_fencing_token)
+        encoded = self._encode(output)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            claim = connection.execute(
+                """
+                SELECT request_sha256, fencing_token, state
+                FROM execution_claims
+                WHERE key = ?
+                """,
+                (key,),
+            ).fetchone()
+            if (
+                claim is None
+                or claim["request_sha256"] != request_sha256
+                or claim["fencing_token"] != expected_fencing_token
+                or claim["state"] != "unknown"
+            ):
+                connection.rollback()
+                raise StaleFencingTokenError("unknown claim changed before reconciliation")
+            connection.execute(
+                """
+                INSERT INTO execution_ledger (key, request_sha256, output_json)
+                VALUES (?, ?, ?)
+                """,
+                (key, request_sha256, encoded),
+            )
+            connection.execute(
+                "DELETE FROM execution_claims WHERE key = ? AND fencing_token = ?",
+                (key, expected_fencing_token),
             )
             connection.commit()

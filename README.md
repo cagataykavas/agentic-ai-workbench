@@ -66,6 +66,13 @@ This keeps a human-in-the-loop workflow concrete: approval is represented as exe
 
 Successful idempotent calls are stored using an explicit or deterministic SHA-256 idempotency key. The dependency executor additionally binds each key to the canonical tool-and-arguments digest, so a changed request cannot receive a stale replay. Equivalent retries return `replayed` with the previous output instead of repeating the side effect. An optional standard-library SQLite ledger preserves these decisions across process restarts while keeping the in-memory default convenient for tests.
 
+The SQLite adapter also claims new work before tool dispatch. One worker receives a monotonically
+increasing fencing token; competitors fail closed without invoking the handler. Handlers can read
+`get_current_fencing_token()` and forward the value to a dependency that supports conditional
+writes. Expired leases and post-dispatch failures become `unknown` rather than being retried
+optimistically. Recovery therefore requires either a trusted external success receipt or an
+explicit authorization to retry with the next fencing token.
+
 This is useful for agent systems because transport retries, duplicated messages and repeated model plans should not automatically duplicate downstream writes.
 
 ### Bounded execution
@@ -200,6 +207,7 @@ GitHub Actions validates the full public engineering surface:
 - idempotent replay;
 - fail-closed idempotency-key payload binding;
 - restart-safe SQLite replay and concurrent terminal-result protection;
+- 64-worker claim contention, fencing-token rotation and unknown-outcome reconciliation;
 - execution budget handling;
 - trace evaluation;
 - deterministic demo smoke test;

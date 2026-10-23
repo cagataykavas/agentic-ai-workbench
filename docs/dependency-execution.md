@@ -27,6 +27,7 @@ from src.sqlite_ledger import SQLiteExecutionLedger
 executor = DependencyExecutor(
     registry,
     ledger=SQLiteExecutionLedger("execution-ledger.db"),
+    claim_lease_seconds=30,
 )
 ```
 
@@ -34,6 +35,31 @@ The adapter stores canonical JSON outputs, preserves the first terminal result f
 uses an immediate transaction to serialize competing commits. A replacement process opening the
 same database therefore replays the prior success or rejects a changed request digest without
 calling the tool again.
+
+Before a new idempotent handler starts, the adapter atomically creates a lease and returns a
+monotonically increasing fencing token. A handler that writes to a dependency should propagate it:
+
+```python
+from src.dag_execution import get_current_fencing_token
+
+async def publish(arguments: dict) -> dict:
+    token = get_current_fencing_token()
+    return await downstream.put(arguments, fencing_token=token)
+```
+
+The downstream system must reject tokens older than the greatest token it has accepted. Local
+fencing alone cannot revoke a remote write already in progress.
+
+If the handler raises after dispatch, or the lease expires before a trusted terminal result is
+recorded, the claim becomes `unknown`. An ordinary retry receives
+`idempotency_outcome_unknown` and does not call the tool. Reconciliation is intentionally explicit:
+
+- `record_reconciled_success(...)` persists a verified remote receipt without redispatch; or
+- `retry_unknown_claim(...)` records an operator decision that no side effect committed and issues
+  the next fencing token.
+
+Both operations require the request digest and current token, so a stale reconciler cannot replace
+a newer decision.
 
 ## Guarantees
 
@@ -53,6 +79,12 @@ calling the tool again.
   replay across later executions; equivalent JSON objects with reordered keys still replay safely.
 - Arguments are canonicalized and copied at admission, preventing caller mutation after validation.
 - Synchronous handlers run off the event loop; asynchronous handlers are supported directly.
+- SQLite-backed idempotent actions acquire a transactionally serialized claim before dispatch;
+  competitors receive a bounded busy result and do not invoke the handler.
+- Lease expiry and post-dispatch handler errors stop at an explicit unknown-outcome boundary rather
+  than silently repeating a possibly committed side effect.
+- Fenced completion requires the active request digest and fencing token. Validation failures
+  release their claim because the handler has not started.
 - Caller cancellation is not reported until the active wave reaches a terminal state, avoiding an
   abandoned in-process call whose outcome is unknown to the ledger.
 - Traces bind the task and admitted plan with SHA-256 identities and expose bounded error classes,
@@ -60,15 +92,13 @@ calling the tool again.
 
 ## Operational boundary
 
-This scheduler and its concurrency limit are in-process. `SQLiteExecutionLedger` makes terminal
-results durable and coordinates commits through a shared local database, but it does not make the
-ledger-check, remote side effect, and ledger-record sequence one atomic operation. A crash can still
-strand a remote side effect between its commit and the local record; two workers can also both pass
-an empty-ledger check before either records a result. Production tools therefore still need
-downstream idempotency keys, transport deadlines, authenticated receipts, and reconciliation. The
-scheduler also treats declared dependencies as policy input; it cannot discover a planner's omitted
-data or side-effect dependency.
+This scheduler and its concurrency limit are in-process. `SQLiteExecutionLedger` coordinates claims
+and terminal commits on one host, but it does not make a remote side effect and the local ledger one
+atomic transaction. A crash can still strand a committed remote effect before its receipt is
+recorded. Fencing is effective only when the downstream system enforces the token; otherwise the
+unknown-outcome gate prevents automatic replay but cannot undo or prove a remote commit. Production
+tools therefore still need downstream idempotency keys, transport deadlines, authenticated
+receipts, reconciliation and a distributed coordinator when execution spans hosts or regions.
 
-The next production step is a claim/lease protocol that fences workers before dispatch and records
-each terminal result before unlocking children across replicas. SQLite is a single-host reference
-adapter, not a distributed coordinator.
+The next production step is an authenticated reconciliation receipt contract plus lease/unknown
+metrics and alerts. SQLite remains a single-host reference adapter, not a distributed coordinator.

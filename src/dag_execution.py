@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import re
 from collections.abc import Awaitable
+from contextvars import ContextVar, Token
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any, cast
@@ -19,6 +21,11 @@ from src.governed_runtime import (
     ToolRegistry,
     ToolSpec,
 )
+from src.sqlite_ledger import (
+    ClaimDisposition,
+    ClaimingExecutionLedger,
+    StaleFencingTokenError,
+)
 
 MAX_ARGUMENT_BYTES = 65_536
 MAX_ACTIONS_HARD_LIMIT = 256
@@ -26,6 +33,16 @@ MAX_DEPENDENCIES_PER_ACTION = 32
 MAX_TOTAL_DEPENDENCIES = 2_048
 MAX_CONCURRENCY_HARD_LIMIT = 64
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_CURRENT_FENCING_TOKEN: ContextVar[int | None] = ContextVar(
+    "agent_tool_fencing_token",
+    default=None,
+)
+
+
+def get_current_fencing_token() -> int | None:
+    """Return the active tool claim token for downstream conditional writes."""
+
+    return _CURRENT_FENCING_TOKEN.get()
 
 
 class PlanValidationError(ValueError):
@@ -63,6 +80,7 @@ class DagActionResult:
     error_code: str | None
     policy: PolicyResult
     idempotency_key_sha256: str
+    fencing_token: int | None = None
 
     @property
     def satisfies_dependency(self) -> bool:
@@ -150,16 +168,25 @@ class DependencyExecutor:
         ledger: ExecutionLedger | None = None,
         max_actions: int = 128,
         max_concurrency: int = 8,
+        claim_lease_seconds: float = 30.0,
     ) -> None:
         if not 1 <= max_actions <= MAX_ACTIONS_HARD_LIMIT:
             raise ValueError("max_actions is outside the supported range")
         if not 1 <= max_concurrency <= MAX_CONCURRENCY_HARD_LIMIT:
             raise ValueError("max_concurrency is outside the supported range")
+        if (
+            isinstance(claim_lease_seconds, bool)
+            or not isinstance(claim_lease_seconds, (int, float))
+            or not math.isfinite(claim_lease_seconds)
+            or not 0 < claim_lease_seconds <= 3_600
+        ):
+            raise ValueError("claim_lease_seconds must be finite and in (0, 3600]")
         self.registry = registry
         self.policy = policy or ToolPolicy()
         self.ledger = ledger or ExecutionLedger()
         self.max_actions = max_actions
         self.max_concurrency = max_concurrency
+        self.claim_lease_seconds = float(claim_lease_seconds)
 
     def _prepare(self, plan: list[DependencyAction]) -> tuple[list[_PreparedAction], str]:
         if not plan:
@@ -318,37 +345,103 @@ class DependencyExecutor:
                 key_digest,
             )
 
-        try:
-            cached = (
-                self.ledger.get_for_request(action.idempotency_key, action.request_sha256)
-                if action.tool.idempotent
-                else None
-            )
-        except IdempotencyPayloadMismatchError:
-            return DagActionResult(
-                action.action_id,
-                action.tool.name,
-                DagActionStatus.FAILED,
-                None,
-                "idempotency_key_payload_mismatch",
-                policy_result,
-                key_digest,
-            )
-        if cached is not None:
-            return DagActionResult(
-                action.action_id,
-                action.tool.name,
-                DagActionStatus.REPLAYED,
-                cached,
-                None,
-                policy_result,
-                key_digest,
-            )
+        claim_ledger = (
+            self.ledger
+            if action.tool.idempotent and isinstance(self.ledger, ClaimingExecutionLedger)
+            else None
+        )
+        fencing_token: int | None = None
+        if claim_ledger is not None:
+            try:
+                claim = await asyncio.to_thread(
+                    claim_ledger.claim_for_request,
+                    action.idempotency_key,
+                    action.request_sha256,
+                    lease_seconds=self.claim_lease_seconds,
+                )
+            except IdempotencyPayloadMismatchError:
+                return DagActionResult(
+                    action.action_id,
+                    action.tool.name,
+                    DagActionStatus.FAILED,
+                    None,
+                    "idempotency_key_payload_mismatch",
+                    policy_result,
+                    key_digest,
+                )
+            if claim.disposition is ClaimDisposition.REPLAYED:
+                return DagActionResult(
+                    action.action_id,
+                    action.tool.name,
+                    DagActionStatus.REPLAYED,
+                    claim.output,
+                    None,
+                    policy_result,
+                    key_digest,
+                )
+            if claim.disposition is ClaimDisposition.BUSY:
+                return DagActionResult(
+                    action.action_id,
+                    action.tool.name,
+                    DagActionStatus.FAILED,
+                    None,
+                    "idempotency_claim_busy",
+                    policy_result,
+                    key_digest,
+                    claim.fencing_token,
+                )
+            if claim.disposition is ClaimDisposition.UNKNOWN:
+                return DagActionResult(
+                    action.action_id,
+                    action.tool.name,
+                    DagActionStatus.FAILED,
+                    None,
+                    "idempotency_outcome_unknown",
+                    policy_result,
+                    key_digest,
+                    claim.fencing_token,
+                )
+            fencing_token = claim.fencing_token
+            if fencing_token is None:
+                raise RuntimeError("acquired claim did not provide a fencing token")
+        elif action.tool.idempotent:
+            try:
+                cached = self.ledger.get_for_request(
+                    action.idempotency_key,
+                    action.request_sha256,
+                )
+            except IdempotencyPayloadMismatchError:
+                return DagActionResult(
+                    action.action_id,
+                    action.tool.name,
+                    DagActionStatus.FAILED,
+                    None,
+                    "idempotency_key_payload_mismatch",
+                    policy_result,
+                    key_digest,
+                )
+            if cached is not None:
+                return DagActionResult(
+                    action.action_id,
+                    action.tool.name,
+                    DagActionStatus.REPLAYED,
+                    cached,
+                    None,
+                    policy_result,
+                    key_digest,
+                )
+
         try:
             if action.tool.validator:
                 action.tool.validator(dict(action.arguments))
-            output = await self._call_handler(action)
-        except Exception as exc:  # noqa: BLE001 - a tool boundary must isolate handler failures.
+        except Exception as exc:  # noqa: BLE001 - validators are an untrusted boundary.
+            if claim_ledger is not None and fencing_token is not None:
+                await asyncio.to_thread(
+                    claim_ledger.abandon_claim,
+                    action.idempotency_key,
+                    action.request_sha256,
+                    fencing_token,
+                )
             return DagActionResult(
                 action.action_id,
                 action.tool.name,
@@ -357,23 +450,65 @@ class DependencyExecutor:
                 type(exc).__name__,
                 policy_result,
                 key_digest,
+                fencing_token,
             )
+
+        context_token: Token[int | None] | None = None
+        if fencing_token is not None:
+            context_token = _CURRENT_FENCING_TOKEN.set(fencing_token)
+        try:
+            output = await self._call_handler(action)
+        except Exception as exc:  # noqa: BLE001 - a tool boundary must isolate handler failures.
+            if claim_ledger is not None and fencing_token is not None:
+                try:
+                    await asyncio.to_thread(
+                        claim_ledger.mark_claim_unknown,
+                        action.idempotency_key,
+                        action.request_sha256,
+                        fencing_token,
+                    )
+                except StaleFencingTokenError:
+                    pass
+            return DagActionResult(
+                action.action_id,
+                action.tool.name,
+                DagActionStatus.FAILED,
+                None,
+                "tool_outcome_unknown" if claim_ledger is not None else type(exc).__name__,
+                policy_result,
+                key_digest,
+                fencing_token,
+            )
+        finally:
+            if context_token is not None:
+                _CURRENT_FENCING_TOKEN.reset(context_token)
+
         if action.tool.idempotent:
             try:
-                self.ledger.record_for_request(
-                    action.idempotency_key,
-                    action.request_sha256,
-                    output,
-                )
-            except IdempotencyPayloadMismatchError:
+                if claim_ledger is not None and fencing_token is not None:
+                    await asyncio.to_thread(
+                        claim_ledger.complete_claim,
+                        action.idempotency_key,
+                        action.request_sha256,
+                        fencing_token,
+                        output,
+                    )
+                else:
+                    self.ledger.record_for_request(
+                        action.idempotency_key,
+                        action.request_sha256,
+                        output,
+                    )
+            except (IdempotencyPayloadMismatchError, StaleFencingTokenError):
                 return DagActionResult(
                     action.action_id,
                     action.tool.name,
                     DagActionStatus.FAILED,
                     None,
-                    "idempotency_commit_conflict",
+                    "idempotency_fence_lost",
                     policy_result,
                     key_digest,
+                    fencing_token,
                 )
         return DagActionResult(
             action.action_id,
@@ -383,6 +518,7 @@ class DependencyExecutor:
             None,
             policy_result,
             key_digest,
+            fencing_token,
         )
 
     async def execute(
