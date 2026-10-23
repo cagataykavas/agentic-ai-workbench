@@ -73,6 +73,13 @@ writes. Expired leases and post-dispatch failures become `unknown` rather than b
 optimistically. Recovery therefore requires either a trusted external success receipt or an
 explicit authorization to retry with the next fencing token.
 
+External success receipts can be authenticated with HMAC-SHA256 before reconciliation. The
+signed envelope binds the idempotency key, canonical request digest, fencing token, canonical
+output, issue time and rotation key ID. Verification rejects stale, future-dated, malformed,
+oversized, unknown-key or modified receipts before the ledger transaction. The matching unknown
+claim then consumes the receipt atomically, so concurrent delivery produces one terminal result
+without redispatching the tool.
+
 This is useful for agent systems because transport retries, duplicated messages and repeated model plans should not automatically duplicate downstream writes.
 
 ### Bounded execution
@@ -192,6 +199,7 @@ src/demo.py                    local baseline demo
 src/governed_runtime.py        policy, approvals, idempotency, bounded execution
 src/dag_execution.py           validated dependency DAG execution
 src/sqlite_ledger.py            restart-safe SQLite idempotency adapter
+src/reconciliation.py          authenticated unknown-outcome receipts
 src/runtime_eval.py            trace-level operational metrics
 human_agent_collaboration.py   human/agent routing example
 workflow_experiment.py         workflow comparison metrics
