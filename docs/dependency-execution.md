@@ -58,6 +58,11 @@ recorded, the claim becomes `unknown`. An ordinary retry receives
 - `retry_unknown_claim(...)` records an operator decision that no side effect committed and issues
   the next fencing token.
 
+Production callers can replace the unauthenticated operator path with
+`retry_unknown_claim_authenticated(...)`. Its HMAC receipt binds the idempotency key, request
+digest, current fencing token, issue time, signing key and bounded next-lease duration. Verification
+happens before the transaction; the transaction then advances the exact unknown claim only once.
+
 Both operations require the request digest and current token, so a stale reconciler cannot replace
 a newer decision.
 
@@ -100,5 +105,6 @@ unknown-outcome gate prevents automatic replay but cannot undo or prove a remote
 tools therefore still need downstream idempotency keys, transport deadlines, authenticated
 receipts, reconciliation and a distributed coordinator when execution spans hosts or regions.
 
-The next production step is an authenticated reconciliation receipt contract plus lease/unknown
-metrics and alerts. SQLite remains a single-host reference adapter, not a distributed coordinator.
+The next production step is lease/unknown metrics and alerts plus a real remote status adapter that
+issues success or retry receipts from authoritative downstream state. SQLite remains a single-host
+reference adapter, not a distributed coordinator.

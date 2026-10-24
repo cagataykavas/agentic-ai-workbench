@@ -80,6 +80,12 @@ oversized, unknown-key or modified receipts before the ledger transaction. The m
 claim then consumes the receipt atomically, so concurrent delivery produces one terminal result
 without redispatching the tool.
 
+The opposite reconciliation decision is authenticated as well. A retry authorization proves that
+the exact unknown claim did **not** commit its side effect and binds the current fencing token plus
+the permitted next lease duration into a domain-separated HMAC envelope. The SQLite ledger verifies
+the envelope before atomically advancing to the next token; 64 concurrent deliveries still produce
+one retry owner. A stale, edited, cross-protocol or wrong-claim authorization cannot reopen work.
+
 This is useful for agent systems because transport retries, duplicated messages and repeated model plans should not automatically duplicate downstream writes.
 
 ### Bounded execution
@@ -200,6 +206,7 @@ src/governed_runtime.py        policy, approvals, idempotency, bounded execution
 src/dag_execution.py           validated dependency DAG execution
 src/sqlite_ledger.py            restart-safe SQLite idempotency adapter
 src/reconciliation.py          authenticated unknown-outcome receipts
+docs/retry-authorization.md    signed no-commit decisions and retry threat model
 src/runtime_eval.py            trace-level operational metrics
 human_agent_collaboration.py   human/agent routing example
 workflow_experiment.py         workflow comparison metrics
