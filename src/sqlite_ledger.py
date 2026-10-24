@@ -17,7 +17,11 @@ from src.governed_runtime import (
     IdempotencyPayloadMismatchError,
     Payload,
 )
-from src.reconciliation import ReceiptAuthenticator, ReconciliationReceipt
+from src.reconciliation import (
+    ReceiptAuthenticator,
+    ReconciliationReceipt,
+    RetryAuthorizationReceipt,
+)
 
 
 class LedgerCorruptionError(RuntimeError):
@@ -525,4 +529,18 @@ class SQLiteExecutionLedger(ExecutionLedger):
             receipt.request_sha256,
             receipt.fencing_token,
             output,
+        )
+
+    def retry_unknown_claim_authenticated(
+        self,
+        receipt: RetryAuthorizationReceipt,
+        authenticator: ReceiptAuthenticator,
+    ) -> ExecutionClaim:
+        """Consume one authentic no-commit decision and advance the fence once."""
+        retry_lease_ms = authenticator.verify_retry_authorization(receipt)
+        return self.retry_unknown_claim(
+            receipt.key,
+            receipt.request_sha256,
+            receipt.fencing_token,
+            lease_seconds=retry_lease_ms / 1_000,
         )
