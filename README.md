@@ -85,6 +85,9 @@ the exact unknown claim did **not** commit its side effect and binds the current
 the permitted next lease duration into a domain-separated HMAC envelope. The SQLite ledger verifies
 the envelope before atomically advancing to the next token; 64 concurrent deliveries still produce
 one retry owner. A stale, edited, cross-protocol or wrong-claim authorization cannot reopen work.
+Each claim additionally persists a bounded retry allowance and consumes it in the same SQLite
+transaction as the fencing-token advance. A replacement process cannot loosen that claim's policy,
+and an exhausted claim remains blocked even when presented with an authentic authorization.
 
 This is useful for agent systems because transport retries, duplicated messages and repeated model plans should not automatically duplicate downstream writes.
 
@@ -223,6 +226,7 @@ GitHub Actions validates the full public engineering surface:
 - fail-closed idempotency-key payload binding;
 - restart-safe SQLite replay and concurrent terminal-result protection;
 - 64-worker claim contention, fencing-token rotation and unknown-outcome reconciliation;
+- restart-safe retry-budget exhaustion and legacy schema migration;
 - execution budget handling;
 - trace evaluation;
 - deterministic demo smoke test;
@@ -244,7 +248,7 @@ No external model API is required for CI.
 - durable trace/event store;
 - async tools with deadlines and cancellation;
 - per-tool concurrency/bulkhead limits;
-- retry budgets and circuit breakers;
+- per-tool circuit breakers and fleet-wide retry rate limits;
 - OpenTelemetry spans;
 - planner adapters for OpenAI-compatible models;
 - offline agent trajectory evaluation and replay.
