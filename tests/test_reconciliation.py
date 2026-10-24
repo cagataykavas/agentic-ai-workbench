@@ -13,6 +13,7 @@ from src.reconciliation import (
 )
 from src.sqlite_ledger import (
     ClaimDisposition,
+    RetryBudgetExhaustedError,
     SQLiteExecutionLedger,
     StaleFencingTokenError,
 )
@@ -295,6 +296,8 @@ def test_authenticated_retry_advances_fence_with_signed_lease(tmp_path) -> None:
     assert retry.disposition is ClaimDisposition.ACQUIRED
     assert retry.fencing_token == 2
     assert retry.lease_expires_at_ms == 102_500
+    assert retry.retry_count == 1
+    assert retry.retry_limit == 3
 
 
 def test_tampered_retry_authorization_cannot_mutate_unknown_claim(tmp_path) -> None:
@@ -352,3 +355,112 @@ def test_concurrent_retry_authorization_delivery_advances_once(tmp_path) -> None
     assert current.disposition is ClaimDisposition.BUSY
     assert current.fencing_token == 2
     assert isinstance(receipt, RetryAuthorizationReceipt)
+
+
+def test_retry_budget_is_persisted_and_cannot_be_raised_by_a_new_process(tmp_path) -> None:
+    now = [100.0]
+    verifier = authenticator(now)
+    database = tmp_path / "ledger.db"
+    ledger = SQLiteExecutionLedger(
+        database,
+        max_retry_attempts=2,
+        clock=lambda: now[0],
+    )
+    unknown_claim(ledger)
+
+    for fencing_token in (1, 2):
+        authorization = verifier.issue_retry_authorization(
+            KEY,
+            REQUEST_SHA256,
+            fencing_token,
+            lease_seconds=30,
+        )
+        reopened = SQLiteExecutionLedger(
+            database,
+            max_retry_attempts=100,
+            clock=lambda: now[0],
+        ).retry_unknown_claim_authenticated(authorization, verifier)
+        assert reopened.retry_count == fencing_token
+        assert reopened.retry_limit == 2
+        ledger.mark_claim_unknown(KEY, REQUEST_SHA256, fencing_token + 1)
+
+    exhausted = verifier.issue_retry_authorization(
+        KEY,
+        REQUEST_SHA256,
+        3,
+        lease_seconds=30,
+    )
+    with pytest.raises(RetryBudgetExhaustedError, match=r"2/2") as caught:
+        SQLiteExecutionLedger(
+            database,
+            max_retry_attempts=100,
+            clock=lambda: now[0],
+        ).retry_unknown_claim_authenticated(exhausted, verifier)
+
+    assert caught.value.retry_count == 2
+    assert caught.value.retry_limit == 2
+    blocked = ledger.claim_for_request(KEY, REQUEST_SHA256, lease_seconds=30)
+    assert blocked.disposition is ClaimDisposition.UNKNOWN
+    assert blocked.fencing_token == 3
+    assert blocked.retry_count == blocked.retry_limit == 2
+
+
+def test_zero_retry_budget_rejects_valid_authorization_without_mutation(tmp_path) -> None:
+    now = [100.0]
+    verifier = authenticator(now)
+    ledger = SQLiteExecutionLedger(
+        tmp_path / "ledger.db",
+        max_retry_attempts=0,
+        clock=lambda: now[0],
+    )
+    unknown_claim(ledger)
+    authorization = verifier.issue_retry_authorization(
+        KEY,
+        REQUEST_SHA256,
+        1,
+        lease_seconds=30,
+    )
+
+    with pytest.raises(RetryBudgetExhaustedError, match=r"0/0"):
+        ledger.retry_unknown_claim_authenticated(authorization, verifier)
+
+    blocked = ledger.claim_for_request(KEY, REQUEST_SHA256, lease_seconds=30)
+    assert blocked.disposition is ClaimDisposition.UNKNOWN
+    assert blocked.fencing_token == 1
+    assert blocked.retry_count == blocked.retry_limit == 0
+
+
+def test_exhausted_retry_budget_rejects_all_concurrent_deliveries(tmp_path) -> None:
+    now = [100.0]
+    verifier = authenticator(now)
+    database = tmp_path / "ledger.db"
+    ledger = SQLiteExecutionLedger(
+        database,
+        max_retry_attempts=1,
+        clock=lambda: now[0],
+    )
+    unknown_claim(ledger)
+    first = verifier.issue_retry_authorization(KEY, REQUEST_SHA256, 1, lease_seconds=30)
+    ledger.retry_unknown_claim_authenticated(first, verifier)
+    ledger.mark_claim_unknown(KEY, REQUEST_SHA256, 2)
+    exhausted = verifier.issue_retry_authorization(KEY, REQUEST_SHA256, 2, lease_seconds=30)
+
+    def consume(_delivery: int) -> str:
+        try:
+            SQLiteExecutionLedger(
+                database,
+                max_retry_attempts=100,
+                clock=lambda: now[0],
+            ).retry_unknown_claim_authenticated(exhausted, verifier)
+        except RetryBudgetExhaustedError:
+            return "budget_exhausted"
+        return "unsafe_advance"
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        outcomes = list(pool.map(consume, range(64)))
+
+    assert outcomes == ["budget_exhausted"] * 64
+    blocked = ledger.claim_for_request(KEY, REQUEST_SHA256, lease_seconds=30)
+    assert blocked.disposition is ClaimDisposition.UNKNOWN
+    assert blocked.fencing_token == 2
+    assert blocked.retry_count == blocked.retry_limit == 1

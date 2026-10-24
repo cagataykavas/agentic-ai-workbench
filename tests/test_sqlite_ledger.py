@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -155,6 +156,44 @@ def test_file_backing_and_positive_timeout_are_required(tmp_path) -> None:
         SQLiteExecutionLedger(":memory:")
     with pytest.raises(ValueError, match="finite and positive"):
         SQLiteExecutionLedger(tmp_path / "ledger.db", timeout_seconds=0)
+
+
+@pytest.mark.parametrize("value", [True, -1, 101, 1.5])
+def test_retry_budget_policy_is_bounded(value, tmp_path) -> None:
+    with pytest.raises(ValueError, match="max_retry_attempts"):
+        SQLiteExecutionLedger(tmp_path / "ledger.db", max_retry_attempts=value)
+
+
+def test_existing_claim_table_migrates_with_conservative_retry_budget(tmp_path) -> None:
+    database = tmp_path / "legacy.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE execution_claims (
+                key TEXT PRIMARY KEY,
+                request_sha256 TEXT NOT NULL,
+                fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+                lease_expires_at_ms INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('running', 'unknown')),
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            ) STRICT
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO execution_claims (
+                key, request_sha256, fencing_token, lease_expires_at_ms, state
+            ) VALUES ('write:legacy', ?, 1, 0, 'unknown')
+            """,
+            ("a" * 64,),
+        )
+
+    ledger = SQLiteExecutionLedger(database, max_retry_attempts=100)
+    migrated = ledger.claim_for_request("write:legacy", "a" * 64, lease_seconds=30)
+
+    assert migrated.disposition is ClaimDisposition.UNKNOWN
+    assert migrated.retry_count == 0
+    assert migrated.retry_limit == 3
 
 
 def test_concurrent_workers_obtain_exactly_one_execution_claim(tmp_path) -> None:

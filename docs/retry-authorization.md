@@ -43,9 +43,21 @@ Verification occurs before `BEGIN IMMEDIATE`. Inside the transaction, the ledger
 key, request digest, fencing token and `unknown` state before advancing to `running`. Concurrent or
 replayed deliveries therefore produce one owner and stale-token failures for the rest.
 
+Each new claim also persists an immutable `retry_limit` and an atomically incremented
+`retry_count`. The creator's `max_retry_attempts` policy applies for the claim's full lifetime;
+reopening the database with a more permissive process configuration cannot raise it. Once consumed,
+even an otherwise valid signed authorization fails closed with `RetryBudgetExhaustedError` and the
+claim remains `unknown` for operator reconciliation. Existing databases are migrated with a
+conservative three-retry limit.
+
+```python
+ledger = SQLiteExecutionLedger("agent.db", max_retry_attempts=2)
+```
+
 ## Boundary
 
 The signer must derive the no-commit decision from authoritative downstream state; HMAC proves who
 issued the decision, not that the decision was correct. Database rollback can also replay old state.
 Production systems still need protected keys, durable backups, audit retention, downstream fencing
-enforcement and monitoring for long-lived unknown claims.
+enforcement and monitoring for long-lived or budget-exhausted unknown claims. The retry limit is
+per idempotency claim, not a global rate limiter or downstream circuit breaker.

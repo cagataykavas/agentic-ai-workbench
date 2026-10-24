@@ -32,6 +32,15 @@ class StaleFencingTokenError(RuntimeError):
     """A worker no longer owns the claim it is trying to mutate."""
 
 
+class RetryBudgetExhaustedError(RuntimeError):
+    """An unknown claim has consumed its persisted retry allowance."""
+
+    def __init__(self, retry_count: int, retry_limit: int) -> None:
+        self.retry_count = retry_count
+        self.retry_limit = retry_limit
+        super().__init__(f"retry budget exhausted ({retry_count}/{retry_limit})")
+
+
 class ClaimDisposition(StrEnum):
     ACQUIRED = "acquired"
     REPLAYED = "replayed"
@@ -45,6 +54,8 @@ class ExecutionClaim:
     fencing_token: int | None = None
     lease_expires_at_ms: int | None = None
     output: Payload | None = None
+    retry_count: int | None = None
+    retry_limit: int | None = None
 
 
 @runtime_checkable
@@ -72,6 +83,8 @@ class ClaimingExecutionLedger(Protocol):
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _MAX_LEASE_SECONDS = 3_600.0
+_MAX_RETRY_ATTEMPTS = 100
+_LEGACY_RETRY_LIMIT = 3
 
 
 class SQLiteExecutionLedger(ExecutionLedger):
@@ -87,14 +100,18 @@ class SQLiteExecutionLedger(ExecutionLedger):
         database: str | os.PathLike[str],
         *,
         timeout_seconds: float = 5.0,
+        max_retry_attempts: int = _LEGACY_RETRY_LIMIT,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
         if os.fspath(database) == ":memory:":
             raise ValueError("SQLiteExecutionLedger requires a file-backed database")
+        if type(max_retry_attempts) is not int or not 0 <= max_retry_attempts <= _MAX_RETRY_ATTEMPTS:
+            raise ValueError("max_retry_attempts must be an integer in [0, 100]")
         self.database = Path(database)
         self.timeout_seconds = timeout_seconds
+        self.max_retry_attempts = max_retry_attempts
         self._clock = clock
         self._initialize()
 
@@ -111,28 +128,57 @@ class SQLiteExecutionLedger(ExecutionLedger):
     def _initialize(self) -> None:
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS execution_ledger (
-                    key TEXT PRIMARY KEY,
-                    request_sha256 TEXT,
-                    output_json TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                ) STRICT
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS execution_claims (
-                    key TEXT PRIMARY KEY,
-                    request_sha256 TEXT NOT NULL,
-                    fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
-                    lease_expires_at_ms INTEGER NOT NULL,
-                    state TEXT NOT NULL CHECK (state IN ('running', 'unknown')),
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                ) STRICT
-                """
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS execution_ledger (
+                        key TEXT PRIMARY KEY,
+                        request_sha256 TEXT,
+                        output_json TEXT NOT NULL,
+                        recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ) STRICT
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS execution_claims (
+                        key TEXT PRIMARY KEY,
+                        request_sha256 TEXT NOT NULL,
+                        fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+                        lease_expires_at_ms INTEGER NOT NULL,
+                        state TEXT NOT NULL CHECK (state IN ('running', 'unknown')),
+                        retry_count INTEGER NOT NULL DEFAULT 0
+                            CHECK (retry_count >= 0 AND retry_count <= retry_limit),
+                        retry_limit INTEGER NOT NULL DEFAULT 3
+                            CHECK (retry_limit >= 0 AND retry_limit <= 100),
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ) STRICT
+                    """
+                )
+                columns = {
+                    str(row["name"]) for row in connection.execute("PRAGMA table_info(execution_claims)")
+                }
+                if "retry_count" not in columns:
+                    connection.execute(
+                        """
+                        ALTER TABLE execution_claims
+                        ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0
+                            CHECK (retry_count >= 0 AND retry_count <= 100)
+                        """
+                    )
+                if "retry_limit" not in columns:
+                    connection.execute(
+                        f"""
+                        ALTER TABLE execution_claims
+                        ADD COLUMN retry_limit INTEGER NOT NULL DEFAULT {_LEGACY_RETRY_LIMIT}
+                            CHECK (retry_limit >= 0 AND retry_limit <= 100)
+                        """
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
     @staticmethod
     def _validate_claim_identity(key: str, request_sha256: str) -> None:
@@ -284,7 +330,8 @@ class SQLiteExecutionLedger(ExecutionLedger):
 
             claim = connection.execute(
                 """
-                SELECT request_sha256, fencing_token, lease_expires_at_ms, state
+                SELECT request_sha256, fencing_token, lease_expires_at_ms, state,
+                       retry_count, retry_limit
                 FROM execution_claims
                 WHERE key = ?
                 """,
@@ -294,19 +341,28 @@ class SQLiteExecutionLedger(ExecutionLedger):
                 connection.execute(
                     """
                     INSERT INTO execution_claims (
-                        key, request_sha256, fencing_token, lease_expires_at_ms, state
-                    ) VALUES (?, ?, 1, ?, 'running')
+                        key, request_sha256, fencing_token, lease_expires_at_ms, state,
+                        retry_count, retry_limit
+                    ) VALUES (?, ?, 1, ?, 'running', 0, ?)
                     """,
-                    (key, request_sha256, expires_at_ms),
+                    (key, request_sha256, expires_at_ms, self.max_retry_attempts),
                 )
                 connection.commit()
-                return ExecutionClaim(ClaimDisposition.ACQUIRED, 1, expires_at_ms)
+                return ExecutionClaim(
+                    ClaimDisposition.ACQUIRED,
+                    1,
+                    expires_at_ms,
+                    retry_count=0,
+                    retry_limit=self.max_retry_attempts,
+                )
             if claim["request_sha256"] != request_sha256:
                 connection.rollback()
                 raise IdempotencyPayloadMismatchError
 
             fencing_token = int(claim["fencing_token"])
             lease_expires_at_ms = int(claim["lease_expires_at_ms"])
+            retry_count = int(claim["retry_count"])
+            retry_limit = int(claim["retry_limit"])
             if claim["state"] == "unknown" or lease_expires_at_ms <= now_ms:
                 if claim["state"] != "unknown":
                     connection.execute(
@@ -322,12 +378,16 @@ class SQLiteExecutionLedger(ExecutionLedger):
                     ClaimDisposition.UNKNOWN,
                     fencing_token,
                     lease_expires_at_ms,
+                    retry_count=retry_count,
+                    retry_limit=retry_limit,
                 )
             connection.commit()
             return ExecutionClaim(
                 ClaimDisposition.BUSY,
                 fencing_token,
                 lease_expires_at_ms,
+                retry_count=retry_count,
+                retry_limit=retry_limit,
             )
 
     def _owned_running_claim(
@@ -339,7 +399,8 @@ class SQLiteExecutionLedger(ExecutionLedger):
     ) -> sqlite3.Row:
         claim = connection.execute(
             """
-            SELECT request_sha256, fencing_token, lease_expires_at_ms, state
+            SELECT request_sha256, fencing_token, lease_expires_at_ms, state,
+                   retry_count, retry_limit
             FROM execution_claims
             WHERE key = ?
             """,
@@ -446,7 +507,7 @@ class SQLiteExecutionLedger(ExecutionLedger):
             connection.execute("BEGIN IMMEDIATE")
             claim = connection.execute(
                 """
-                SELECT request_sha256, fencing_token, state
+                SELECT request_sha256, fencing_token, state, retry_count, retry_limit
                 FROM execution_claims
                 WHERE key = ?
                 """,
@@ -460,18 +521,30 @@ class SQLiteExecutionLedger(ExecutionLedger):
             ):
                 connection.rollback()
                 raise StaleFencingTokenError("unknown claim changed before retry authorization")
+            retry_count = int(claim["retry_count"])
+            retry_limit = int(claim["retry_limit"])
+            if retry_count >= retry_limit:
+                connection.rollback()
+                raise RetryBudgetExhaustedError(retry_count, retry_limit)
             next_token = expected_fencing_token + 1
+            next_retry_count = retry_count + 1
             connection.execute(
                 """
                 UPDATE execution_claims
                 SET fencing_token = ?, lease_expires_at_ms = ?, state = 'running',
-                    updated_at = CURRENT_TIMESTAMP
+                    retry_count = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE key = ?
                 """,
-                (next_token, expires_at_ms, key),
+                (next_token, expires_at_ms, next_retry_count, key),
             )
             connection.commit()
-            return ExecutionClaim(ClaimDisposition.ACQUIRED, next_token, expires_at_ms)
+            return ExecutionClaim(
+                ClaimDisposition.ACQUIRED,
+                next_token,
+                expires_at_ms,
+                retry_count=next_retry_count,
+                retry_limit=retry_limit,
+            )
 
     def record_reconciled_success(
         self,
