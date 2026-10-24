@@ -9,6 +9,7 @@ from src.reconciliation import (
     ReceiptAuthenticationError,
     ReceiptAuthenticator,
     ReconciliationReceipt,
+    RetryAuthorizationReceipt,
 )
 from src.sqlite_ledger import (
     ClaimDisposition,
@@ -199,3 +200,155 @@ def test_receipt_wire_shape_does_not_expose_secret_material() -> None:
     assert "secret" not in wire
     assert SECRET_2.hex() not in str(wire)
     assert isinstance(receipt, ReconciliationReceipt)
+
+
+def test_retry_authorization_is_deterministic_and_binds_lease() -> None:
+    now = [100.0]
+    signer = authenticator(now)
+
+    first = signer.issue_retry_authorization(
+        KEY,
+        REQUEST_SHA256,
+        1,
+        lease_seconds=2.5,
+    )
+    second = signer.issue_retry_authorization(
+        KEY,
+        REQUEST_SHA256,
+        1,
+        lease_seconds=2.5,
+    )
+
+    assert first == second
+    assert first.retry_lease_ms == 2_500
+    assert signer.verify_retry_authorization(first) == 2_500
+    assert first.to_dict()["receipt_type"] == "retry_authorization"
+    assert SECRET_2.hex() not in str(first.to_dict())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda receipt: replace(receipt, key="write:changed"),
+        lambda receipt: replace(receipt, request_sha256="b" * 64),
+        lambda receipt: replace(receipt, fencing_token=2),
+        lambda receipt: replace(receipt, retry_lease_ms=30_001),
+        lambda receipt: replace(receipt, signature="0" * 64),
+    ],
+)
+def test_modified_retry_authorization_fields_are_rejected(mutate) -> None:
+    verifier = authenticator([100.0])
+    receipt = verifier.issue_retry_authorization(
+        KEY,
+        REQUEST_SHA256,
+        1,
+        lease_seconds=30,
+    )
+
+    with pytest.raises(ReceiptAuthenticationError, match="signature is invalid"):
+        verifier.verify_retry_authorization(mutate(receipt))
+
+
+def test_retry_authorization_rejects_stale_and_cross_protocol_receipts() -> None:
+    now = [100.0]
+    verifier = authenticator(now)
+    retry = verifier.issue_retry_authorization(
+        KEY,
+        REQUEST_SHA256,
+        1,
+        lease_seconds=30,
+    )
+    success = verifier.issue(KEY, REQUEST_SHA256, 1, {"saved": 7})
+
+    with pytest.raises(ReceiptAuthenticationError, match="unsupported type"):
+        verifier.verify_retry_authorization(success)  # type: ignore[arg-type]
+    now[0] = 131.0
+    with pytest.raises(ReceiptAuthenticationError, match="stale"):
+        verifier.verify_retry_authorization(retry)
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, float("inf"), 3_601])
+def test_retry_authorization_rejects_invalid_lease_policy(value: object) -> None:
+    with pytest.raises(ValueError, match="retry lease_seconds"):
+        authenticator([100.0]).issue_retry_authorization(
+            KEY,
+            REQUEST_SHA256,
+            1,
+            lease_seconds=value,  # type: ignore[arg-type]
+        )
+
+
+def test_authenticated_retry_advances_fence_with_signed_lease(tmp_path) -> None:
+    now = [100.0]
+    verifier = authenticator(now)
+    ledger = SQLiteExecutionLedger(tmp_path / "ledger.db", clock=lambda: now[0])
+    unknown_claim(ledger)
+    receipt = verifier.issue_retry_authorization(
+        KEY,
+        REQUEST_SHA256,
+        1,
+        lease_seconds=2.5,
+    )
+
+    retry = ledger.retry_unknown_claim_authenticated(receipt, verifier)
+
+    assert retry.disposition is ClaimDisposition.ACQUIRED
+    assert retry.fencing_token == 2
+    assert retry.lease_expires_at_ms == 102_500
+
+
+def test_tampered_retry_authorization_cannot_mutate_unknown_claim(tmp_path) -> None:
+    now = [100.0]
+    verifier = authenticator(now)
+    ledger = SQLiteExecutionLedger(tmp_path / "ledger.db", clock=lambda: now[0])
+    unknown_claim(ledger)
+    receipt = verifier.issue_retry_authorization(
+        KEY,
+        REQUEST_SHA256,
+        1,
+        lease_seconds=30,
+    )
+
+    with pytest.raises(ReceiptAuthenticationError, match="signature is invalid"):
+        ledger.retry_unknown_claim_authenticated(
+            replace(receipt, retry_lease_ms=60_000),
+            verifier,
+        )
+
+    blocked = ledger.claim_for_request(KEY, REQUEST_SHA256, lease_seconds=30)
+    assert blocked.disposition is ClaimDisposition.UNKNOWN
+    assert blocked.fencing_token == 1
+
+
+def test_concurrent_retry_authorization_delivery_advances_once(tmp_path) -> None:
+    now = [100.0]
+    verifier = authenticator(now)
+    database = tmp_path / "ledger.db"
+    ledger = SQLiteExecutionLedger(database, clock=lambda: now[0])
+    unknown_claim(ledger)
+    receipt = verifier.issue_retry_authorization(
+        KEY,
+        REQUEST_SHA256,
+        1,
+        lease_seconds=30,
+    )
+
+    def consume(_delivery: int) -> str:
+        try:
+            SQLiteExecutionLedger(
+                database,
+                clock=lambda: now[0],
+            ).retry_unknown_claim_authenticated(receipt, verifier)
+        except StaleFencingTokenError:
+            return "rejected"
+        return "advanced"
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        outcomes = list(pool.map(consume, range(64)))
+
+    assert outcomes.count("advanced") == 1
+    assert outcomes.count("rejected") == 63
+    current = ledger.claim_for_request(KEY, REQUEST_SHA256, lease_seconds=30)
+    assert current.disposition is ClaimDisposition.BUSY
+    assert current.fencing_token == 2
+    assert isinstance(receipt, RetryAuthorizationReceipt)
