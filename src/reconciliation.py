@@ -17,6 +17,7 @@ _KEY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _MAX_OUTPUT_BYTES = 65_536
 _MAX_KEYRING_SIZE = 16
 _MAX_RECEIPT_AGE_SECONDS = 86_400.0
+_MAX_RETRY_LEASE_SECONDS = 3_600.0
 
 
 class ReceiptAuthenticationError(ValueError):
@@ -68,6 +69,33 @@ class ReconciliationReceipt:
             "request_sha256": self.request_sha256,
             "fencing_token": self.fencing_token,
             "output": self.output(),
+            "issued_at_ms": self.issued_at_ms,
+            "key_id": self.key_id,
+            "signature": self.signature,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RetryAuthorizationReceipt:
+    """Authentic proof that an exact unknown claim may advance to a new fence."""
+
+    key: str
+    request_sha256: str
+    fencing_token: int
+    retry_lease_ms: int
+    issued_at_ms: int
+    key_id: str
+    signature: str
+    schema_version: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "receipt_type": "retry_authorization",
+            "key": self.key,
+            "request_sha256": self.request_sha256,
+            "fencing_token": self.fencing_token,
+            "retry_lease_ms": self.retry_lease_ms,
             "issued_at_ms": self.issued_at_ms,
             "key_id": self.key_id,
             "signature": self.signature,
@@ -145,6 +173,49 @@ class ReceiptAuthenticator:
             allow_nan=False,
         ).encode("utf-8")
 
+    @staticmethod
+    def _retry_payload(receipt: RetryAuthorizationReceipt) -> bytes:
+        canonical = {
+            "schema_version": receipt.schema_version,
+            "receipt_type": "retry_authorization",
+            "key": receipt.key,
+            "request_sha256": receipt.request_sha256,
+            "fencing_token": receipt.fencing_token,
+            "retry_lease_ms": receipt.retry_lease_ms,
+            "issued_at_ms": receipt.issued_at_ms,
+            "key_id": receipt.key_id,
+        }
+        return json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+
+    def _verification_secret(
+        self,
+        *,
+        key_id: str,
+        issued_at_ms: int,
+        signature: str,
+    ) -> bytes:
+        if not isinstance(key_id, str) or not _KEY_ID_PATTERN.fullmatch(key_id):
+            raise ReceiptAuthenticationError("receipt key_id is malformed")
+        secret = self._keys.get(key_id)
+        if secret is None:
+            raise ReceiptAuthenticationError("receipt key_id is unknown")
+        if type(issued_at_ms) is not int or issued_at_ms < 0:
+            raise ReceiptAuthenticationError("receipt issued_at_ms is malformed")
+        if not isinstance(signature, str) or not _SHA256_PATTERN.fullmatch(signature):
+            raise ReceiptAuthenticationError("receipt signature is malformed")
+        now_ms = math.floor(self._clock() * 1_000)
+        if issued_at_ms > now_ms + self.max_future_skew_ms:
+            raise ReceiptAuthenticationError("receipt was issued too far in the future")
+        if now_ms - issued_at_ms > self.max_age_ms:
+            raise ReceiptAuthenticationError("receipt is stale")
+        return secret
+
     def issue(
         self,
         key: str,
@@ -185,24 +256,84 @@ class ReceiptAuthenticator:
         if receipt.schema_version != 1:
             raise ReceiptAuthenticationError("receipt schema_version is unsupported")
         self._validate_identity(receipt.key, receipt.request_sha256, receipt.fencing_token)
-        if not isinstance(receipt.key_id, str) or not _KEY_ID_PATTERN.fullmatch(receipt.key_id):
-            raise ReceiptAuthenticationError("receipt key_id is malformed")
-        secret = self._keys.get(receipt.key_id)
-        if secret is None:
-            raise ReceiptAuthenticationError("receipt key_id is unknown")
-        if type(receipt.issued_at_ms) is not int or receipt.issued_at_ms < 0:
-            raise ReceiptAuthenticationError("receipt issued_at_ms is malformed")
-        if not isinstance(receipt.signature, str) or not _SHA256_PATTERN.fullmatch(receipt.signature):
-            raise ReceiptAuthenticationError("receipt signature is malformed")
+        secret = self._verification_secret(
+            key_id=receipt.key_id,
+            issued_at_ms=receipt.issued_at_ms,
+            signature=receipt.signature,
+        )
         output = receipt.output()
         if _canonical_output(output) != receipt.output_json:
             raise ReceiptAuthenticationError("receipt output is not canonical JSON")
-        now_ms = math.floor(self._clock() * 1_000)
-        if receipt.issued_at_ms > now_ms + self.max_future_skew_ms:
-            raise ReceiptAuthenticationError("receipt was issued too far in the future")
-        if now_ms - receipt.issued_at_ms > self.max_age_ms:
-            raise ReceiptAuthenticationError("receipt is stale")
         expected = hmac.new(secret, self._payload(receipt), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, receipt.signature):
             raise ReceiptAuthenticationError("receipt signature is invalid")
         return output
+
+    @staticmethod
+    def _retry_lease_ms(lease_seconds: float) -> int:
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, (int, float))
+            or not math.isfinite(lease_seconds)
+            or not 0 < lease_seconds <= _MAX_RETRY_LEASE_SECONDS
+        ):
+            raise ValueError("retry lease_seconds must be finite and in (0, 3600]")
+        return max(1, math.floor(lease_seconds * 1_000))
+
+    def issue_retry_authorization(
+        self,
+        key: str,
+        request_sha256: str,
+        fencing_token: int,
+        *,
+        lease_seconds: float,
+    ) -> RetryAuthorizationReceipt:
+        """Authorize one fenced retry after proving no side effect committed."""
+        self._validate_identity(key, request_sha256, fencing_token)
+        unsigned = RetryAuthorizationReceipt(
+            key=key,
+            request_sha256=request_sha256,
+            fencing_token=fencing_token,
+            retry_lease_ms=self._retry_lease_ms(lease_seconds),
+            issued_at_ms=math.floor(self._clock() * 1_000),
+            key_id=self.signing_key_id,
+            signature="",
+        )
+        signature = hmac.new(
+            self._keys[self.signing_key_id],
+            self._retry_payload(unsigned),
+            hashlib.sha256,
+        ).hexdigest()
+        return RetryAuthorizationReceipt(
+            key=unsigned.key,
+            request_sha256=unsigned.request_sha256,
+            fencing_token=unsigned.fencing_token,
+            retry_lease_ms=unsigned.retry_lease_ms,
+            issued_at_ms=unsigned.issued_at_ms,
+            key_id=unsigned.key_id,
+            signature=signature,
+        )
+
+    def verify_retry_authorization(
+        self,
+        receipt: RetryAuthorizationReceipt,
+    ) -> int:
+        """Return the signed retry lease in milliseconds after full verification."""
+        if not isinstance(receipt, RetryAuthorizationReceipt):
+            raise ReceiptAuthenticationError("retry authorization has an unsupported type")
+        if receipt.schema_version != 1:
+            raise ReceiptAuthenticationError("receipt schema_version is unsupported")
+        self._validate_identity(receipt.key, receipt.request_sha256, receipt.fencing_token)
+        if type(receipt.retry_lease_ms) is not int or not 1 <= receipt.retry_lease_ms <= int(
+            _MAX_RETRY_LEASE_SECONDS * 1_000
+        ):
+            raise ReceiptAuthenticationError("retry authorization lease is malformed")
+        secret = self._verification_secret(
+            key_id=receipt.key_id,
+            issued_at_ms=receipt.issued_at_ms,
+            signature=receipt.signature,
+        )
+        expected = hmac.new(secret, self._retry_payload(receipt), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, receipt.signature):
+            raise ReceiptAuthenticationError("receipt signature is invalid")
+        return receipt.retry_lease_ms
