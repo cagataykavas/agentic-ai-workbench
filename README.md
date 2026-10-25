@@ -88,6 +88,9 @@ one retry owner. A stale, edited, cross-protocol or wrong-claim authorization ca
 Each claim additionally persists a bounded retry allowance and consumes it in the same SQLite
 transaction as the fencing-token advance. A replacement process cannot loosen that claim's policy,
 and an exhausted claim remains blocked even when presented with an authentic authorization.
+The ledger also exports key-free gauges and durable low-cardinality counters for unknown transitions,
+authorized retries and budget exhaustion; those counters commit in the same transaction as the
+corresponding claim state.
 
 This is useful for agent systems because transport retries, duplicated messages and repeated model plans should not automatically duplicate downstream writes.
 
@@ -207,9 +210,10 @@ src/core.py                    original deterministic tool loop
 src/demo.py                    local baseline demo
 src/governed_runtime.py        policy, approvals, idempotency, bounded execution
 src/dag_execution.py           validated dependency DAG execution
-src/sqlite_ledger.py            restart-safe SQLite idempotency adapter
+src/sqlite_ledger.py            restart-safe SQLite idempotency and operational snapshot adapter
 src/reconciliation.py          authenticated unknown-outcome receipts
 docs/retry-authorization.md    signed no-commit decisions and retry threat model
+docs/ledger-observability.md    key-free gauges, durable counters and alerting boundary
 src/runtime_eval.py            trace-level operational metrics
 human_agent_collaboration.py   human/agent routing example
 workflow_experiment.py         workflow comparison metrics
@@ -227,6 +231,7 @@ GitHub Actions validates the full public engineering surface:
 - restart-safe SQLite replay and concurrent terminal-result protection;
 - 64-worker claim contention, fencing-token rotation and unknown-outcome reconciliation;
 - restart-safe retry-budget exhaustion and legacy schema migration;
+- key-free ledger gauges and atomic unknown/retry/exhaustion counters;
 - execution budget handling;
 - trace evaluation;
 - deterministic demo smoke test;
