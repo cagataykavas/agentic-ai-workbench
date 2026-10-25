@@ -10,7 +10,6 @@ from src.sqlite_ledger import (
     SQLiteExecutionLedger,
 )
 
-
 KEY = "write:request-7"
 REQUEST_SHA256 = "a" * 64
 
