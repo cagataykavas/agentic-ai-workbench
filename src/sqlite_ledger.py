@@ -7,7 +7,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -58,6 +58,22 @@ class ExecutionClaim:
     retry_limit: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionLedgerSnapshot:
+    schema_version: int
+    terminal_results: int
+    running_claims: int
+    unknown_claims: int
+    exhausted_unknown_claims: int
+    active_retry_attempts: int
+    unknown_transition_total: int
+    retry_authorized_total: int
+    retry_budget_exhausted_total: int
+
+    def as_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+
 @runtime_checkable
 class ClaimingExecutionLedger(Protocol):
     def claim_for_request(
@@ -85,6 +101,13 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _MAX_LEASE_SECONDS = 3_600.0
 _MAX_RETRY_ATTEMPTS = 100
 _LEGACY_RETRY_LIMIT = 3
+_METRIC_COLUMNS = frozenset(
+    {
+        "unknown_transition_total",
+        "retry_authorized_total",
+        "retry_budget_exhausted_total",
+    }
+)
 
 
 class SQLiteExecutionLedger(ExecutionLedger):
@@ -175,6 +198,25 @@ class SQLiteExecutionLedger(ExecutionLedger):
                             CHECK (retry_limit >= 0 AND retry_limit <= 100)
                         """
                     )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS execution_ledger_metrics (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        unknown_transition_total INTEGER NOT NULL DEFAULT 0
+                            CHECK (unknown_transition_total >= 0),
+                        retry_authorized_total INTEGER NOT NULL DEFAULT 0
+                            CHECK (retry_authorized_total >= 0),
+                        retry_budget_exhausted_total INTEGER NOT NULL DEFAULT 0
+                            CHECK (retry_budget_exhausted_total >= 0)
+                    ) STRICT
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO execution_ledger_metrics (singleton)
+                    VALUES (1)
+                    """
+                )
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -203,6 +245,83 @@ class SQLiteExecutionLedger(ExecutionLedger):
             raise ValueError("lease_seconds must be finite and in (0, 3600]")
         now_ms = math.floor(self._clock() * 1_000)
         return now_ms, now_ms + max(1, math.floor(lease_seconds * 1_000))
+
+    @staticmethod
+    def _increment_metric(
+        connection: sqlite3.Connection,
+        metric: str,
+        amount: int = 1,
+    ) -> None:
+        if metric not in _METRIC_COLUMNS or type(amount) is not int or amount < 0:
+            raise ValueError("invalid execution-ledger metric increment")
+        connection.execute(
+            f"""
+            UPDATE execution_ledger_metrics
+            SET {metric} = {metric} + ?
+            WHERE singleton = 1
+            """,
+            (amount,),
+        )
+
+    def snapshot(self) -> ExecutionLedgerSnapshot:
+        """Return key-free gauges and durable transition counters atomically."""
+
+        now_ms = math.floor(self._clock() * 1_000)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            transitioned = connection.execute(
+                """
+                UPDATE execution_claims
+                SET state = 'unknown', updated_at = CURRENT_TIMESTAMP
+                WHERE state = 'running' AND lease_expires_at_ms <= ?
+                """,
+                (now_ms,),
+            ).rowcount
+            if transitioned:
+                self._increment_metric(
+                    connection,
+                    "unknown_transition_total",
+                    transitioned,
+                )
+            gauges = connection.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN state = 'running' THEN 1 ELSE 0 END) AS running_claims,
+                    SUM(CASE WHEN state = 'unknown' THEN 1 ELSE 0 END) AS unknown_claims,
+                    SUM(
+                        CASE
+                            WHEN state = 'unknown' AND retry_count >= retry_limit THEN 1
+                            ELSE 0
+                        END
+                    ) AS exhausted_unknown_claims,
+                    COALESCE(SUM(retry_count), 0) AS active_retry_attempts
+                FROM execution_claims
+                """
+            ).fetchone()
+            metrics = connection.execute(
+                """
+                SELECT unknown_transition_total, retry_authorized_total,
+                       retry_budget_exhausted_total
+                FROM execution_ledger_metrics WHERE singleton = 1
+                """
+            ).fetchone()
+            terminal_results = int(connection.execute("SELECT COUNT(*) FROM execution_ledger").fetchone()[0])
+            if gauges is None or metrics is None:
+                connection.rollback()
+                raise LedgerCorruptionError("execution-ledger observability state is missing")
+            snapshot = ExecutionLedgerSnapshot(
+                schema_version=1,
+                terminal_results=terminal_results,
+                running_claims=int(gauges["running_claims"] or 0),
+                unknown_claims=int(gauges["unknown_claims"] or 0),
+                exhausted_unknown_claims=int(gauges["exhausted_unknown_claims"] or 0),
+                active_retry_attempts=int(gauges["active_retry_attempts"]),
+                unknown_transition_total=int(metrics["unknown_transition_total"]),
+                retry_authorized_total=int(metrics["retry_authorized_total"]),
+                retry_budget_exhausted_total=int(metrics["retry_budget_exhausted_total"]),
+            )
+            connection.commit()
+            return snapshot
 
     @staticmethod
     def _encode(output: Payload) -> str:
@@ -373,6 +492,7 @@ class SQLiteExecutionLedger(ExecutionLedger):
                         """,
                         (key, fencing_token),
                     )
+                    self._increment_metric(connection, "unknown_transition_total")
                 connection.commit()
                 return ExecutionClaim(
                     ClaimDisposition.UNKNOWN,
@@ -443,6 +563,7 @@ class SQLiteExecutionLedger(ExecutionLedger):
                     """,
                     (key, fencing_token),
                 )
+                self._increment_metric(connection, "unknown_transition_total")
                 connection.commit()
                 raise StaleFencingTokenError("claim lease expired before completion")
             connection.execute(
@@ -488,6 +609,7 @@ class SQLiteExecutionLedger(ExecutionLedger):
                 """,
                 (key, fencing_token),
             )
+            self._increment_metric(connection, "unknown_transition_total")
             connection.commit()
 
     def retry_unknown_claim(
@@ -524,7 +646,8 @@ class SQLiteExecutionLedger(ExecutionLedger):
             retry_count = int(claim["retry_count"])
             retry_limit = int(claim["retry_limit"])
             if retry_count >= retry_limit:
-                connection.rollback()
+                self._increment_metric(connection, "retry_budget_exhausted_total")
+                connection.commit()
                 raise RetryBudgetExhaustedError(retry_count, retry_limit)
             next_token = expected_fencing_token + 1
             next_retry_count = retry_count + 1
@@ -537,6 +660,7 @@ class SQLiteExecutionLedger(ExecutionLedger):
                 """,
                 (next_token, expires_at_ms, next_retry_count, key),
             )
+            self._increment_metric(connection, "retry_authorized_total")
             connection.commit()
             return ExecutionClaim(
                 ClaimDisposition.ACQUIRED,
