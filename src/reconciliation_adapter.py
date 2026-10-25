@@ -17,7 +17,6 @@ from src.reconciliation import (
     RetryAuthorizationReceipt,
 )
 
-
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _PROVIDER_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _MAX_OUTPUT_BYTES = 65_536
@@ -134,7 +133,7 @@ class AuthoritativeReconciliationCoordinator:
     @staticmethod
     def _validate_query(query: ReconciliationQuery) -> None:
         if not isinstance(query, ReconciliationQuery):
-            raise ValueError("query must be a ReconciliationQuery")
+            raise TypeError("query must be a ReconciliationQuery")
         if not isinstance(query.key, str) or not query.key or len(query.key.encode("utf-8")) > 512:
             raise ValueError("query key must be 1-512 UTF-8 bytes")
         if not isinstance(query.request_sha256, str) or not _SHA256_PATTERN.fullmatch(query.request_sha256):

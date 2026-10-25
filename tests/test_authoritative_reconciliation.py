@@ -18,7 +18,6 @@ from src.reconciliation_adapter import (
 )
 from src.sqlite_ledger import ClaimDisposition, SQLiteExecutionLedger
 
-
 KEY = "write:request-7"
 REQUEST_SHA256 = "a" * 64
 QUERY = ReconciliationQuery(KEY, REQUEST_SHA256, 1)
