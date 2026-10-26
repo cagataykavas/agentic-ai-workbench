@@ -222,6 +222,7 @@ src/sqlite_ledger.py            restart-safe SQLite idempotency and operational 
 src/reconciliation.py          authenticated unknown-outcome receipts
 src/reconciliation_adapter.py  authoritative downstream status-to-receipt boundary
 src/http_reconciliation_provider.py  bounded mTLS JSON provider adapter
+tools/mtls_reconciliation_sandbox.py disposable live-TLS fault-injection endpoint
 docs/retry-authorization.md    signed no-commit decisions and retry threat model
 docs/ledger-observability.md    key-free gauges, durable counters and alerting boundary
 docs/authoritative-reconciliation.md  provider contract, deadlines and trust boundary
@@ -235,7 +236,7 @@ tests/                         executable runtime contracts
 
 GitHub Actions validates the full public engineering surface:
 
-- Ruff over the runtime, tests and earlier examples;
+- Ruff over the runtime, integration tooling, tests and earlier examples;
 - policy/approval behavior;
 - idempotent replay;
 - fail-closed idempotency-key payload binding;
@@ -245,6 +246,7 @@ GitHub Actions validates the full public engineering surface:
 - key-free ledger gauges and atomic unknown/retry/exhaustion counters;
 - authoritative committed/not-committed/pending reconciliation decisions;
 - pinned mTLS provider requests and fail-closed HTTP/JSON response validation;
+- live CA/server/client certificate generation, mutual-TLS handshake and timeout-after-observation;
 - execution budget handling;
 - trace evaluation;
 - deterministic demo smoke test;
