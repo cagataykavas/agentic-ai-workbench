@@ -96,7 +96,9 @@ An authoritative reconciliation coordinator can query a downstream system of rec
 path is authorized. It requires an exact claim identity echo, fresh bounded observation and supported
 outcome: `committed` produces a signed success receipt, `not_committed` produces one signed retry
 authorization, and `pending` produces no authority. Late, stale, contradictory or mismatched provider
-responses fail closed.
+responses fail closed. A standard-library HTTPS adapter pins the endpoint, builds a mutually
+authenticated TLS context from CA/client key material, forwards the coordinator deadline to the
+socket, bounds every response read and accepts only strict UTF-8 JSON with the documented schema.
 
 This is useful for agent systems because transport retries, duplicated messages and repeated model plans should not automatically duplicate downstream writes.
 
@@ -219,6 +221,7 @@ src/dag_execution.py           validated dependency DAG execution
 src/sqlite_ledger.py            restart-safe SQLite idempotency and operational snapshot adapter
 src/reconciliation.py          authenticated unknown-outcome receipts
 src/reconciliation_adapter.py  authoritative downstream status-to-receipt boundary
+src/http_reconciliation_provider.py  bounded mTLS JSON provider adapter
 docs/retry-authorization.md    signed no-commit decisions and retry threat model
 docs/ledger-observability.md    key-free gauges, durable counters and alerting boundary
 docs/authoritative-reconciliation.md  provider contract, deadlines and trust boundary
@@ -241,6 +244,7 @@ GitHub Actions validates the full public engineering surface:
 - restart-safe retry-budget exhaustion and legacy schema migration;
 - key-free ledger gauges and atomic unknown/retry/exhaustion counters;
 - authoritative committed/not-committed/pending reconciliation decisions;
+- pinned mTLS provider requests and fail-closed HTTP/JSON response validation;
 - execution budget handling;
 - trace evaluation;
 - deterministic demo smoke test;
