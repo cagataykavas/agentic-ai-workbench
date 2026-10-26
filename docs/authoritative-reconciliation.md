@@ -114,3 +114,25 @@ at the network client layer; the included HTTP adapter does so for connect/read 
 synchronous socket API still cannot be force-cancelled from another thread. The adapter also cannot
 prove that the remote service used a strongly consistent read, so deployments must keep the endpoint
 off eventual-consistency replicas and test ambiguous commits and replica lag against a real sandbox.
+
+## Disposable live-mTLS sandbox
+
+`tools.mtls_reconciliation_sandbox.MtlsReconciliationSandbox` provides a loopback-only HTTPS
+system-of-record endpoint for integration tests. It requires a CA-signed client certificate, exposes
+the peer certificate common name in its captured request evidence, echoes the exact claim identity,
+and can delay a committed response until after the client deadline. Certificates are generated in a
+temporary directory during the test run; no keys or certificate artifacts are committed.
+
+The CI integration contract proves three security-relevant paths with real sockets and OpenSSL:
+
+- a trusted server certificate and required client certificate complete a mutual-TLS handshake,
+  after which the provider accepts one exact authoritative observation;
+- a CA-signed certificate restricted to server authentication is rejected when presented as the
+  client identity, before the request reaches the handler;
+- the sandbox can observe a request before delaying its reply past the socket timeout, and the
+  provider returns no success or retry authority for that ambiguous result.
+
+This harness validates transport authentication and the fail-closed client deadline. It does not
+emulate a replicated database or prove linearizable reads. The next fault-injection increment should
+place a primary/replica state model behind this endpoint and quantify stale-read exposure before
+choosing synchronous replication or a strongly consistent status backend.
