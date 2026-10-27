@@ -20,6 +20,8 @@ from src.reconciliation import (
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _PROVIDER_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _MAX_OUTPUT_BYTES = 65_536
+_MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
+_MAX_REPLICA_ACKNOWLEDGEMENTS = 32
 
 
 class ReconciliationUnavailableError(RuntimeError):
@@ -46,6 +48,61 @@ class ReconciliationQuery:
 
 
 @dataclass(frozen=True, slots=True)
+class NegativeDurabilityProof:
+    """Storage position observed while proving that a claim is absent."""
+
+    authority_epoch: int
+    durable_sequence: int
+    replica_acknowledgements: int
+
+
+@dataclass(frozen=True, slots=True)
+class NegativeObservationPolicy:
+    """Minimum evidence required before absence can authorize a retry."""
+
+    minimum_authority_epoch: int = 1
+    minimum_durable_sequence: int | None = None
+    required_replica_acknowledgements: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.minimum_authority_epoch) is not int
+            or not 0 < self.minimum_authority_epoch <= _MAX_SQLITE_INTEGER
+        ):
+            raise ValueError("minimum_authority_epoch must be a positive SQLite integer")
+        if self.minimum_durable_sequence is not None and (
+            type(self.minimum_durable_sequence) is not int
+            or not 0 < self.minimum_durable_sequence <= _MAX_SQLITE_INTEGER
+        ):
+            raise ValueError("minimum_durable_sequence must be a positive SQLite integer")
+        if self.required_replica_acknowledgements is not None and (
+            type(self.required_replica_acknowledgements) is not int
+            or not 0
+            < self.required_replica_acknowledgements
+            <= _MAX_REPLICA_ACKNOWLEDGEMENTS
+        ):
+            raise ValueError("required_replica_acknowledgements must be in [1, 32]")
+        if (
+            self.minimum_durable_sequence is None
+            and self.required_replica_acknowledgements is None
+        ):
+            raise ValueError("negative observation policy requires a sequence or replica threshold")
+
+    def accepts(self, proof: NegativeDurabilityProof) -> bool:
+        if proof.authority_epoch < self.minimum_authority_epoch:
+            return False
+        sequence_satisfied = (
+            self.minimum_durable_sequence is not None
+            and proof.durable_sequence >= self.minimum_durable_sequence
+        )
+        replica_satisfied = (
+            self.required_replica_acknowledgements is not None
+            and proof.replica_acknowledgements >= self.required_replica_acknowledgements
+        )
+        return sequence_satisfied or replica_satisfied
+
+
+@dataclass(frozen=True, slots=True)
 class DownstreamObservation:
     provider_id: str
     outcome: DownstreamOutcome
@@ -54,6 +111,7 @@ class DownstreamObservation:
     fencing_token: int
     observed_at_ms: int
     output: Payload | None = None
+    negative_proof: NegativeDurabilityProof | None = None
 
 
 class AuthoritativeStatusProvider(Protocol):
@@ -83,6 +141,7 @@ class AuthoritativeReconciliationCoordinator:
         provider: AuthoritativeStatusProvider,
         authenticator: ReceiptAuthenticator,
         *,
+        negative_observation_policy: NegativeObservationPolicy,
         lookup_timeout_seconds: float = 2.0,
         max_observation_age_seconds: float = 30.0,
         max_future_skew_seconds: float = 2.0,
@@ -105,8 +164,11 @@ class AuthoritativeReconciliationCoordinator:
             minimum=0,
             maximum=300,
         )
+        if not isinstance(negative_observation_policy, NegativeObservationPolicy):
+            raise TypeError("negative_observation_policy must be a NegativeObservationPolicy")
         self.provider = provider
         self.authenticator = authenticator
+        self.negative_observation_policy = negative_observation_policy
         self.provider_id = provider_id
         self.lookup_timeout_seconds = float(lookup_timeout_seconds)
         self.max_observation_age_ms = math.floor(max_observation_age_seconds * 1_000)
@@ -138,8 +200,33 @@ class AuthoritativeReconciliationCoordinator:
             raise ValueError("query key must be 1-512 UTF-8 bytes")
         if not isinstance(query.request_sha256, str) or not _SHA256_PATTERN.fullmatch(query.request_sha256):
             raise ValueError("query request_sha256 must be lowercase SHA-256")
-        if type(query.fencing_token) is not int or not 0 < query.fencing_token <= 9_223_372_036_854_775_807:
+        if type(query.fencing_token) is not int or not 0 < query.fencing_token <= _MAX_SQLITE_INTEGER:
             raise ValueError("query fencing_token must be a positive SQLite integer")
+
+    @staticmethod
+    def _canonical_negative_proof(
+        proof: NegativeDurabilityProof | None,
+    ) -> dict[str, int] | None:
+        if proof is None:
+            return None
+        if not isinstance(proof, NegativeDurabilityProof):
+            raise ReconciliationUnavailableError("negative durability proof is malformed")
+        if (
+            type(proof.authority_epoch) is not int
+            or not 0 < proof.authority_epoch <= _MAX_SQLITE_INTEGER
+            or type(proof.durable_sequence) is not int
+            or not 0 <= proof.durable_sequence <= _MAX_SQLITE_INTEGER
+            or type(proof.replica_acknowledgements) is not int
+            or not 0
+            <= proof.replica_acknowledgements
+            <= _MAX_REPLICA_ACKNOWLEDGEMENTS
+        ):
+            raise ReconciliationUnavailableError("negative durability proof is malformed")
+        return {
+            "authority_epoch": proof.authority_epoch,
+            "durable_sequence": proof.durable_sequence,
+            "replica_acknowledgements": proof.replica_acknowledgements,
+        }
 
     @staticmethod
     def _canonical_output(output: Payload | None) -> Payload | None:
@@ -190,15 +277,31 @@ class AuthoritativeReconciliationCoordinator:
             raise ReconciliationUnavailableError("committed observation requires output")
         if observation.outcome is not DownstreamOutcome.COMMITTED and output is not None:
             raise ReconciliationUnavailableError("non-committed observation must not include output")
+        negative_proof = self._canonical_negative_proof(observation.negative_proof)
+        if observation.outcome is DownstreamOutcome.NOT_COMMITTED:
+            if negative_proof is None:
+                raise ReconciliationUnavailableError(
+                    "not-committed observation requires a negative durability proof"
+                )
+            assert observation.negative_proof is not None
+            if not self.negative_observation_policy.accepts(observation.negative_proof):
+                raise ReconciliationUnavailableError(
+                    "negative durability proof does not satisfy retry policy"
+                )
+        elif negative_proof is not None:
+            raise ReconciliationUnavailableError(
+                "only not-committed observations may include a negative durability proof"
+            )
         document = {
             "fencing_token": query.fencing_token,
             "key_sha256": hashlib.sha256(query.key.encode("utf-8")).hexdigest(),
             "observed_at_ms": observation.observed_at_ms,
+            "negative_proof": negative_proof,
             "outcome": observation.outcome.value,
             "output": output,
             "provider_id": observation.provider_id,
             "request_sha256": query.request_sha256,
-            "schema_version": 1,
+            "schema_version": 2,
         }
         encoded = json.dumps(
             document,

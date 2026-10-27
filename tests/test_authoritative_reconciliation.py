@@ -13,6 +13,8 @@ from src.reconciliation_adapter import (
     AuthoritativeReconciliationCoordinator,
     DownstreamObservation,
     DownstreamOutcome,
+    NegativeDurabilityProof,
+    NegativeObservationPolicy,
     ReconciliationQuery,
     ReconciliationUnavailableError,
 )
@@ -56,7 +58,10 @@ def observation(
     outcome: DownstreamOutcome,
     *,
     output: dict[str, object] | None = None,
+    negative_proof: NegativeDurabilityProof | None = None,
 ) -> DownstreamObservation:
+    if outcome is DownstreamOutcome.NOT_COMMITTED and negative_proof is None:
+        negative_proof = NegativeDurabilityProof(1, 0, 1)
     return DownstreamObservation(
         provider_id="payments-primary",
         outcome=outcome,
@@ -65,6 +70,7 @@ def observation(
         fencing_token=1,
         observed_at_ms=100_000,
         output=output,
+        negative_proof=negative_proof,
     )
 
 
@@ -82,10 +88,13 @@ def coordinator(
     now: list[float],
     *,
     monotonic=lambda: 1.0,
+    negative_observation_policy: NegativeObservationPolicy | None = None,
 ) -> AuthoritativeReconciliationCoordinator:
     return AuthoritativeReconciliationCoordinator(
         provider,
         authenticator(now),
+        negative_observation_policy=negative_observation_policy
+        or NegativeObservationPolicy(required_replica_acknowledgements=1),
         lookup_timeout_seconds=0.25,
         max_observation_age_seconds=10,
         max_future_skew_seconds=1,
@@ -118,6 +127,78 @@ def test_not_committed_observation_issues_bounded_retry_authorization() -> None:
     assert decision.outcome is DownstreamOutcome.NOT_COMMITTED
     assert isinstance(decision.receipt, RetryAuthorizationReceipt)
     assert reconciler.authenticator.verify_retry_authorization(decision.receipt) == 2_500
+
+
+def test_not_committed_without_durability_proof_never_issues_retry_authority() -> None:
+    now = [100.0]
+    no_proof = replace(observation(DownstreamOutcome.NOT_COMMITTED), negative_proof=None)
+
+    with pytest.raises(ReconciliationUnavailableError, match="requires a negative durability proof"):
+        coordinator(Provider(no_proof), now).reconcile(QUERY, retry_lease_seconds=30)
+
+
+def test_negative_proof_must_satisfy_epoch_and_one_durability_threshold() -> None:
+    now = [100.0]
+    weak = observation(
+        DownstreamOutcome.NOT_COMMITTED,
+        negative_proof=NegativeDurabilityProof(1, 4, 0),
+    )
+    policy = NegativeObservationPolicy(
+        minimum_authority_epoch=2,
+        minimum_durable_sequence=5,
+        required_replica_acknowledgements=1,
+    )
+
+    with pytest.raises(ReconciliationUnavailableError, match="does not satisfy retry policy"):
+        coordinator(
+            Provider(weak),
+            now,
+            negative_observation_policy=policy,
+        ).reconcile(QUERY, retry_lease_seconds=30)
+
+
+def test_durable_sequence_can_authorize_absence_without_replica_acknowledgement() -> None:
+    now = [100.0]
+    proven = observation(
+        DownstreamOutcome.NOT_COMMITTED,
+        negative_proof=NegativeDurabilityProof(2, 7, 0),
+    )
+    reconciler = coordinator(
+        Provider(proven),
+        now,
+        negative_observation_policy=NegativeObservationPolicy(
+            minimum_authority_epoch=2,
+            minimum_durable_sequence=7,
+        ),
+    )
+
+    decision = reconciler.reconcile(QUERY, retry_lease_seconds=3)
+
+    assert isinstance(decision.receipt, RetryAuthorizationReceipt)
+
+
+def test_negative_proof_is_bound_to_observation_digest() -> None:
+    now = [100.0]
+    first = coordinator(
+        Provider(
+            observation(
+                DownstreamOutcome.NOT_COMMITTED,
+                negative_proof=NegativeDurabilityProof(1, 0, 1),
+            )
+        ),
+        now,
+    ).reconcile(QUERY, retry_lease_seconds=3)
+    second = coordinator(
+        Provider(
+            observation(
+                DownstreamOutcome.NOT_COMMITTED,
+                negative_proof=NegativeDurabilityProof(1, 9, 1),
+            )
+        ),
+        now,
+    ).reconcile(QUERY, retry_lease_seconds=3)
+
+    assert first.observation_sha256 != second.observation_sha256
 
 
 def test_pending_observation_produces_no_execution_authority() -> None:
@@ -203,6 +284,31 @@ def test_contradictory_observation_never_issues_authority(
 ) -> None:
     with pytest.raises(ReconciliationUnavailableError, match=message):
         coordinator(Provider(changed), [100.0]).reconcile(QUERY, retry_lease_seconds=30)
+
+
+def test_non_negative_outcome_cannot_smuggle_a_durability_proof() -> None:
+    changed = observation(
+        DownstreamOutcome.COMMITTED,
+        output={"ok": True},
+        negative_proof=NegativeDurabilityProof(1, 1, 1),
+    )
+
+    with pytest.raises(ReconciliationUnavailableError, match="only not-committed"):
+        coordinator(Provider(changed), [100.0]).reconcile(QUERY, retry_lease_seconds=30)
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {},
+        {"minimum_authority_epoch": True, "required_replica_acknowledgements": 1},
+        {"minimum_durable_sequence": 0},
+        {"required_replica_acknowledgements": 33},
+    ],
+)
+def test_negative_observation_policy_rejects_unsafe_thresholds(policy: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        NegativeObservationPolicy(**policy)  # type: ignore[arg-type]
 
 
 def test_provider_failure_is_normalized_without_leaking_diagnostics() -> None:

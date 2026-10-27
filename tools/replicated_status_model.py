@@ -8,7 +8,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from src.reconciliation_adapter import DownstreamOutcome, ReconciliationQuery
+from src.reconciliation_adapter import (
+    DownstreamOutcome,
+    NegativeDurabilityProof,
+    ReconciliationQuery,
+)
 
 _TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}")
 _REQUEST_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -36,6 +40,7 @@ class ReplicatedCommitEvidence:
 class ModelObservation:
     outcome: DownstreamOutcome
     output: dict[str, Any] | None
+    negative_proof: NegativeDurabilityProof | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +63,9 @@ class ReplicatedStatusModel:
         self._replica: dict[tuple[str, str, int], _Record] = {}
         self._epoch = 1
         self._sequence = 0
+        self._primary_applied_sequence = 0
+        self._replica_applied_sequence = 0
+        self._replica_available = True
         self._lock = threading.Lock()
 
     @staticmethod
@@ -123,6 +131,7 @@ class ReplicatedStatusModel:
                 self._sequence += 1
                 record = _Record(output_json, operation_token, self._sequence)
                 self._primary[identity] = record
+                self._primary_applied_sequence = record.sequence
             elif record.operation_token != operation_token or record.output_json != output_json:
                 raise ValueError("claim identity already belongs to a different operation")
 
@@ -142,6 +151,8 @@ class ReplicatedStatusModel:
         with self._lock:
             changed = sum(self._replica.get(key) != value for key, value in self._primary.items())
             self._replica = dict(self._primary)
+            self._replica_applied_sequence = self._primary_applied_sequence
+            self._replica_available = True
             return changed
 
     def promote_replica(self) -> int:
@@ -149,7 +160,10 @@ class ReplicatedStatusModel:
 
         with self._lock:
             self._primary = dict(self._replica)
+            self._primary_applied_sequence = self._replica_applied_sequence
             self._replica = {}
+            self._replica_applied_sequence = 0
+            self._replica_available = False
             self._epoch += 1
             return self._epoch
 
@@ -158,7 +172,20 @@ class ReplicatedStatusModel:
         with self._lock:
             record = self._primary.get(identity)
             if record is None:
-                return ModelObservation(DownstreamOutcome.NOT_COMMITTED, None)
+                replica_acknowledgements = int(
+                    self._replica_available
+                    and self._replica_applied_sequence == self._primary_applied_sequence
+                    and identity not in self._replica
+                )
+                return ModelObservation(
+                    DownstreamOutcome.NOT_COMMITTED,
+                    None,
+                    NegativeDurabilityProof(
+                        authority_epoch=self._epoch,
+                        durable_sequence=self._primary_applied_sequence,
+                        replica_acknowledgements=replica_acknowledgements,
+                    ),
+                )
             output = json.loads(record.output_json)
             assert isinstance(output, dict)
-            return ModelObservation(DownstreamOutcome.COMMITTED, output)
+            return ModelObservation(DownstreamOutcome.COMMITTED, output, None)

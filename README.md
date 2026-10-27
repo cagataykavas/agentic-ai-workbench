@@ -95,8 +95,9 @@ corresponding claim state.
 An authoritative reconciliation coordinator can query a downstream system of record before either
 path is authorized. It requires an exact claim identity echo, fresh bounded observation and supported
 outcome: `committed` produces a signed success receipt, `not_committed` produces one signed retry
-authorization, and `pending` produces no authority. Late, stale, contradictory or mismatched provider
-responses fail closed. A standard-library HTTPS adapter pins the endpoint, builds a mutually
+authorization only when its authority epoch and durable sequence or replica proof satisfy an explicit
+policy, and `pending` produces no authority. Late, stale, under-proven, contradictory or mismatched
+provider responses fail closed. A standard-library HTTPS adapter pins the endpoint, builds a mutually
 authenticated TLS context from CA/client key material, forwards the coordinator deadline to the
 socket, bounds every response read and accepts only strict UTF-8 JSON with the documented schema.
 
@@ -247,7 +248,8 @@ GitHub Actions validates the full public engineering surface:
 - key-free ledger gauges and atomic unknown/retry/exhaustion counters;
 - authoritative committed/not-committed/pending reconciliation decisions;
 - pinned mTLS provider requests and fail-closed HTTP/JSON response validation;
-- replica-gated reconciliation commits and stale-promotion fault injection over live mTLS;
+- replica-gated reconciliation commits, stale-promotion fault injection and proof-gated negative
+  decisions over live mTLS;
 - live CA/server/client certificate generation, mutual-TLS handshake and timeout-after-observation;
 - execution budget handling;
 - trace evaluation;
