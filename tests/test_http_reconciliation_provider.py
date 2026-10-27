@@ -23,12 +23,13 @@ def response_document(**changes: object) -> dict[str, object]:
     document: dict[str, object] = {
         "fencing_token": 1,
         "key": KEY,
+        "negative_proof": None,
         "observed_at_ms": 100_000,
         "outcome": "committed",
         "output": {"payment_id": "p-7"},
         "provider_id": "payments-primary",
         "request_sha256": REQUEST_SHA256,
-        "schema_version": 1,
+        "schema_version": 2,
     }
     document.update(changes)
     return document
@@ -149,6 +150,26 @@ def test_lookup_posts_canonical_claim_and_forwards_socket_timeout() -> None:
     assert connection.closed
 
 
+def test_lookup_parses_strict_negative_durability_proof() -> None:
+    provider, _, _ = provider_for(
+        encoded_response(
+            outcome="not_committed",
+            output=None,
+            negative_proof={
+                "authority_epoch": 2,
+                "durable_sequence": 7,
+                "replica_acknowledgements": 0,
+            },
+        )
+    )
+
+    observation = provider.lookup(QUERY, timeout_seconds=0.25)
+
+    assert observation.negative_proof is not None
+    assert observation.negative_proof.authority_epoch == 2
+    assert observation.negative_proof.durable_sequence == 7
+
+
 @pytest.mark.parametrize(
     "endpoint",
     [
@@ -244,10 +265,20 @@ def test_mtls_context_builder_loads_ca_and_client_identity(monkeypatch) -> None:
             ),
             "duplicate",
         ),
-        (encoded_response(schema_version=2), "schema version"),
+        (encoded_response(schema_version=1), "schema version"),
         (encoded_response(outcome="probably_committed"), "outcome"),
         (encoded_response(fencing_token=True), "fencing token"),
         (encoded_response(output=["not", "an", "object"]), "output"),
+        (
+            encoded_response(
+                negative_proof={
+                    "authority_epoch": 1,
+                    "durable_sequence": 0,
+                    "replica_acknowledgements": True,
+                }
+            ),
+            "negative durability proof",
+        ),
     ],
 )
 def test_malformed_or_ambiguous_response_fails_closed(

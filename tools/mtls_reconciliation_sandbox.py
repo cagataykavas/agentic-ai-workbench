@@ -11,7 +11,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Self
 
-from src.reconciliation_adapter import DownstreamOutcome, ReconciliationQuery
+from src.reconciliation_adapter import (
+    DownstreamOutcome,
+    NegativeDurabilityProof,
+    ReconciliationQuery,
+)
 from tools.replicated_status_model import ReplicatedStatusModel
 
 _MAX_REQUEST_BYTES = 4_096
@@ -29,6 +33,7 @@ class SandboxScenario:
 
     outcome: DownstreamOutcome
     output: Mapping[str, Any] | None = None
+    negative_proof: NegativeDurabilityProof | None = None
     response_delay_seconds: float = 0.0
 
     def __post_init__(self) -> None:
@@ -38,6 +43,12 @@ class SandboxScenario:
             raise ValueError("committed scenario requires an object output")
         if self.outcome is not DownstreamOutcome.COMMITTED and self.output is not None:
             raise ValueError("non-committed scenario cannot include output")
+        if self.negative_proof is not None and self.outcome is not DownstreamOutcome.NOT_COMMITTED:
+            raise ValueError("only not-committed scenarios can include a negative durability proof")
+        if self.negative_proof is not None and not isinstance(
+            self.negative_proof, NegativeDurabilityProof
+        ):
+            raise TypeError("negative_proof must be a NegativeDurabilityProof")
         if (
             isinstance(self.response_delay_seconds, bool)
             or not isinstance(self.response_delay_seconds, (int, float))
@@ -143,17 +154,29 @@ class MtlsReconciliationSandbox:
                     model_observation = sandbox.status_model.observe(query)
                     outcome = model_observation.outcome
                     output = model_observation.output
+                    negative_proof = model_observation.negative_proof
                     response_delay_seconds = 0.0
                 else:
                     assert sandbox.scenario is not None
                     outcome = sandbox.scenario.outcome
                     output = sandbox.scenario.output
+                    negative_proof = sandbox.scenario.negative_proof
                     response_delay_seconds = sandbox.scenario.response_delay_seconds
 
                 time.sleep(float(response_delay_seconds))
                 response_document = {
                     **document,
+                    "schema_version": 2,
                     "observed_at_ms": received_at_ms,
+                    "negative_proof": (
+                        {
+                            "authority_epoch": negative_proof.authority_epoch,
+                            "durable_sequence": negative_proof.durable_sequence,
+                            "replica_acknowledgements": negative_proof.replica_acknowledgements,
+                        }
+                        if negative_proof is not None
+                        else None
+                    ),
                     "outcome": outcome.value,
                     "output": dict(output) if output is not None else None,
                     "provider_id": sandbox.provider_id,

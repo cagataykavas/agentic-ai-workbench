@@ -56,8 +56,14 @@ ledger = SQLiteExecutionLedger("agent.db", max_retry_attempts=2)
 
 ## Boundary
 
-The signer must derive the no-commit decision from authoritative downstream state; HMAC proves who
-issued the decision, not that the decision was correct. Database rollback can also replay old state.
+The coordinator requires every `not_committed` observation to carry an authority epoch plus applied
+durable sequence and replica-acknowledgement count. A deployment policy must require a current epoch
+and at least one safe sequence or replica threshold before the signer issues this receipt. Those
+fields are bound into the observation digest, while the compact retry receipt remains the consumable
+claim/lease authority.
+
+The signer must still derive the proof from authoritative downstream state; HMAC proves who issued
+the decision, not that the datastore metadata was truthful. Database rollback can also replay old state.
 Production systems still need protected keys, durable backups, audit retention, downstream fencing
 enforcement and monitoring for long-lived or budget-exhausted unknown claims. The retry limit is
 per idempotency claim, not a global rate limiter or downstream circuit breaker.

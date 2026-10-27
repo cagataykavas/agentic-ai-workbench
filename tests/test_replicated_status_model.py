@@ -9,6 +9,7 @@ from tools.replicated_status_model import (
 )
 
 QUERY = ReconciliationQuery("write:request-7", "a" * 64, 1)
+OTHER_QUERY = ReconciliationQuery("write:request-8", "c" * 64, 1)
 TOKEN = "b" * 64
 
 
@@ -23,7 +24,36 @@ def test_local_acknowledgement_can_be_lost_when_stale_replica_is_promoted() -> N
     model.promote_replica()
 
     assert evidence.replica_acknowledgements == 0
-    assert model.observe(QUERY).outcome is DownstreamOutcome.NOT_COMMITTED
+    observation = model.observe(QUERY)
+    assert observation.outcome is DownstreamOutcome.NOT_COMMITTED
+    assert observation.negative_proof is not None
+    assert observation.negative_proof.authority_epoch == 2
+    assert observation.negative_proof.durable_sequence == 0
+    assert observation.negative_proof.replica_acknowledgements == 0
+
+
+def test_synchronized_replica_attests_absence_at_same_sequence() -> None:
+    model = ReplicatedStatusModel()
+
+    observation = model.observe(QUERY)
+
+    assert observation.negative_proof is not None
+    assert observation.negative_proof.durable_sequence == 0
+    assert observation.negative_proof.replica_acknowledgements == 1
+
+
+def test_promoted_replica_preserves_durable_sequence_for_negative_proof() -> None:
+    model = ReplicatedStatusModel()
+    model.commit(OTHER_QUERY, {"payment_id": "p-8"}, operation_token=TOKEN)
+    model.replicate_all()
+    model.promote_replica()
+
+    observation = model.observe(QUERY)
+
+    assert observation.negative_proof is not None
+    assert observation.negative_proof.authority_epoch == 2
+    assert observation.negative_proof.durable_sequence == 1
+    assert observation.negative_proof.replica_acknowledgements == 0
 
 
 def test_replica_threshold_fails_closed_then_same_token_reconciles() -> None:
@@ -52,7 +82,9 @@ def test_replica_threshold_fails_closed_then_same_token_reconciles() -> None:
     assert evidence.sequence == 1
     assert evidence.replica_acknowledgements == 1
     assert evidence.operation_token_sha256 != TOKEN
-    assert model.observe(QUERY).output == {"payment_id": "p-7"}
+    observation = model.observe(QUERY)
+    assert observation.output == {"payment_id": "p-7"}
+    assert observation.negative_proof is None
 
 
 def test_different_operation_cannot_take_over_an_existing_claim() -> None:

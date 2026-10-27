@@ -13,6 +13,7 @@ from urllib.parse import SplitResult, urlsplit
 from src.reconciliation_adapter import (
     DownstreamObservation,
     DownstreamOutcome,
+    NegativeDurabilityProof,
     ReconciliationQuery,
     ReconciliationUnavailableError,
 )
@@ -25,12 +26,18 @@ _MAX_RESPONSE_BYTES = 1_048_576
 _EXPECTED_RESPONSE_FIELDS = {
     "fencing_token",
     "key",
+    "negative_proof",
     "observed_at_ms",
     "outcome",
     "output",
     "provider_id",
     "request_sha256",
     "schema_version",
+}
+_EXPECTED_NEGATIVE_PROOF_FIELDS = {
+    "authority_epoch",
+    "durable_sequence",
+    "replica_acknowledgements",
 }
 
 
@@ -218,13 +225,14 @@ class MtlsJsonStatusProvider:
             raise ReconciliationUnavailableError("provider response is not valid UTF-8 JSON") from exc
         if not isinstance(document, dict) or set(document) != _EXPECTED_RESPONSE_FIELDS:
             raise ReconciliationUnavailableError("provider response schema is unsupported")
-        if type(document["schema_version"]) is not int or document["schema_version"] != 1:
+        if type(document["schema_version"]) is not int or document["schema_version"] != 2:
             raise ReconciliationUnavailableError("provider response schema version is unsupported")
         provider_id = document["provider_id"]
         key = document["key"]
         request_sha256 = document["request_sha256"]
         fencing_token = document["fencing_token"]
         observed_at_ms = document["observed_at_ms"]
+        negative_proof_document = document["negative_proof"]
         output = document["output"]
         if not isinstance(provider_id, str) or not _PROVIDER_ID_PATTERN.fullmatch(provider_id):
             raise ReconciliationUnavailableError("provider response identity is malformed")
@@ -242,6 +250,23 @@ class MtlsJsonStatusProvider:
             outcome = DownstreamOutcome(document["outcome"])
         except (TypeError, ValueError) as exc:
             raise ReconciliationUnavailableError("provider response outcome is unsupported") from exc
+        negative_proof: NegativeDurabilityProof | None = None
+        if negative_proof_document is not None:
+            if (
+                not isinstance(negative_proof_document, dict)
+                or set(negative_proof_document) != _EXPECTED_NEGATIVE_PROOF_FIELDS
+                or type(negative_proof_document["authority_epoch"]) is not int
+                or type(negative_proof_document["durable_sequence"]) is not int
+                or type(negative_proof_document["replica_acknowledgements"]) is not int
+            ):
+                raise ReconciliationUnavailableError(
+                    "provider response negative durability proof is malformed"
+                )
+            negative_proof = NegativeDurabilityProof(
+                authority_epoch=negative_proof_document["authority_epoch"],
+                durable_sequence=negative_proof_document["durable_sequence"],
+                replica_acknowledgements=negative_proof_document["replica_acknowledgements"],
+            )
         return DownstreamObservation(
             provider_id=provider_id,
             outcome=outcome,
@@ -250,6 +275,7 @@ class MtlsJsonStatusProvider:
             fencing_token=fencing_token,
             observed_at_ms=observed_at_ms,
             output=output,
+            negative_proof=negative_proof,
         )
 
     def lookup(

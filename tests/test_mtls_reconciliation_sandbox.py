@@ -8,8 +8,11 @@ from pathlib import Path
 import pytest
 
 from src.http_reconciliation_provider import MtlsJsonStatusProvider
+from src.reconciliation import ReceiptAuthenticator
 from src.reconciliation_adapter import (
+    AuthoritativeReconciliationCoordinator,
     DownstreamOutcome,
+    NegativeObservationPolicy,
     ReconciliationQuery,
     ReconciliationUnavailableError,
 )
@@ -232,6 +235,46 @@ def test_live_lookup_exposes_primary_only_commit_loss_after_failover(
     assert evidence.replica_acknowledgements == 0
     assert observation.outcome is DownstreamOutcome.NOT_COMMITTED
     assert observation.output is None
+    assert observation.negative_proof is not None
+    assert observation.negative_proof.authority_epoch == 2
+    assert observation.negative_proof.durable_sequence == 0
+    assert observation.negative_proof.replica_acknowledgements == 0
+
+
+def test_live_negative_observation_below_durable_sequence_fails_closed(
+    certificates: dict[str, Path],
+) -> None:
+    model = ReplicatedStatusModel()
+    model.commit(
+        QUERY,
+        {"payment_id": "p-7"},
+        operation_token="b" * 64,
+    )
+    model.promote_replica()
+
+    with MtlsReconciliationSandbox(
+        provider_id="payments-primary",
+        server_cert_file=certificates["server_cert"],
+        server_key_file=certificates["server_key"],
+        client_ca_file=certificates["ca"],
+        status_model=model,
+    ) as sandbox:
+        coordinator = AuthoritativeReconciliationCoordinator(
+            _provider(certificates, sandbox.endpoint),
+            ReceiptAuthenticator(
+                {"current": b"a" * 32},
+                signing_key_id="current",
+                max_age_seconds=30,
+            ),
+            negative_observation_policy=NegativeObservationPolicy(
+                minimum_authority_epoch=2,
+                minimum_durable_sequence=1,
+            ),
+            lookup_timeout_seconds=1,
+        )
+
+        with pytest.raises(ReconciliationUnavailableError, match="does not satisfy retry policy"):
+            coordinator.reconcile(QUERY, retry_lease_seconds=1)
 
 
 def test_live_lookup_preserves_replica_acknowledged_commit_after_failover(
@@ -266,3 +309,4 @@ def test_live_lookup_preserves_replica_acknowledged_commit_after_failover(
     assert evidence.replica_acknowledgements == 1
     assert observation.outcome is DownstreamOutcome.COMMITTED
     assert observation.output == {"payment_id": "p-7"}
+    assert observation.negative_proof is None

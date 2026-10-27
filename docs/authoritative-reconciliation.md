@@ -30,7 +30,9 @@ coordinator also validates the configured provider identity, observation freshne
 JSON bounds and lookup deadline before it signs anything:
 
 - `committed` requires the authoritative output and produces a success receipt;
-- `not_committed` must not contain output and produces one bounded retry authorization;
+- `not_committed` must not contain output, must carry a negative durability proof that satisfies the
+  configured epoch plus durable-sequence or replica threshold, and only then produces one bounded
+  retry authorization;
 - `pending` must not contain output and produces no receipt.
 
 Identity mismatch, stale/future observations, contradictory output, malformed responses, provider
@@ -46,6 +48,7 @@ the public constructor does not accept an arbitrary unauthenticated transport co
 
 ```python
 from src.http_reconciliation_provider import MtlsJsonStatusProvider
+from src.reconciliation_adapter import NegativeObservationPolicy
 
 provider = MtlsJsonStatusProvider(
     provider_id="payments-primary",
@@ -58,6 +61,11 @@ provider = MtlsJsonStatusProvider(
 coordinator = AuthoritativeReconciliationCoordinator(
     provider,
     receipt_authenticator,
+    negative_observation_policy=NegativeObservationPolicy(
+        minimum_authority_epoch=42,
+        minimum_durable_sequence=9182,
+        required_replica_acknowledgements=1,
+    ),
     lookup_timeout_seconds=0.5,
 )
 ```
@@ -85,24 +93,44 @@ exactly these fields:
 {
   "fencing_token": 1,
   "key": "payment:request-7",
+  "negative_proof": null,
   "observed_at_ms": 100000,
   "outcome": "committed",
   "output": {"payment_id": "p-7"},
   "provider_id": "payments-primary",
   "request_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "schema_version": 1
+  "schema_version": 2
 }
 ```
+
+A negative response uses the same strict response schema and replaces `negative_proof` with the
+storage position that established absence:
+
+```json
+{
+  "authority_epoch": 42,
+  "durable_sequence": 9182,
+  "replica_acknowledgements": 0
+}
+```
+
+The policy always requires `authority_epoch` to meet its minimum. It then accepts either a durable
+sequence at or beyond the caller's known safe watermark or the configured count of replicas that
+observed absence at the same sequence. Requiring the policy explicitly prevents an integration from
+silently reverting to trust-on-first-negative behavior. A missing, malformed, stale-epoch or
+below-threshold proof fails closed before a retry receipt is signed.
 
 The adapter limits the streamed read even when `Content-Length` is absent or dishonest. It rejects
 oversized bodies, compression, duplicate JSON fields, invalid UTF-8, non-finite numbers, unknown or
 missing fields, malformed identities and unsupported outcomes. It does not copy an upstream body or
 transport diagnostic into its stable error text. The coordinator then performs the security-relevant
-echo, freshness and outcome/output consistency checks before granting authority.
+echo, freshness, outcome/output consistency and negative-proof policy checks before granting
+authority.
 
 `observation_sha256` is a privacy-reduced commitment for correlation: it hashes the idempotency key
-and binds the provider ID, request digest, fence, observed time, outcome and canonical output. It is
-not an independent signature or proof that the provider told the truth. The HMAC receipt proves
+and binds the provider ID, request digest, fence, observed time, outcome, canonical output and
+negative durability proof. It is not an independent signature or proof that the provider told the
+truth. The HMAC receipt proves
 that the configured coordinator authorized a ledger transition; correctness still depends on the
 provider adapter reading an authoritative, strongly consistent system of record. Certificate and
 private-key files must come from the deployment's secret mount and be rotated outside this library;
@@ -112,8 +140,9 @@ The elapsed-time check prevents a late response from creating authority, but syn
 cannot cancel an already-blocked provider call. Production adapters should enforce the same timeout
 at the network client layer; the included HTTP adapter does so for connect/read operations. Python's
 synchronous socket API still cannot be force-cancelled from another thread. The adapter also cannot
-prove that the remote service used a strongly consistent read, so deployments must keep the endpoint
-off eventual-consistency replicas and test ambiguous commits and replica lag against a real sandbox.
+prove that the remote service reported a truthful epoch, sequence or replica count. Deployments must
+derive those fields from protected datastore metadata, keep policy watermarks current and test
+ambiguous commits and replica lag against the real persistence system.
 
 ## Disposable live-mTLS sandbox
 
@@ -155,8 +184,16 @@ SHA-256 commitment to the operation token. A different token or output cannot ta
 claim identity. Tests exercise both policies through the real TLS adapter, so transport and storage
 fault boundaries are evaluated together.
 
+Negative model observations expose the current authority epoch, the promoted primary's applied
+sequence and whether the replica independently confirms absence at that exact sequence. The live
+mTLS integration test demonstrates that a stale promotion produces `(epoch=2, sequence=0,
+replica_acknowledgements=0)` and that a coordinator requiring durable sequence `1` issues no retry
+authority. The same proof is included in the privacy-reduced observation digest for audit
+correlation.
+
 This remains a deterministic two-node state model, not a Redis/PostgreSQL consensus implementation.
 It does not simulate split brain, replica persistence, partial log replay, network reordering or
 quorum membership changes. Production deployments must validate the chosen datastore's actual
-durability and promotion rules. The next increment should bind a minimum durable sequence or quorum
-proof to negative reconciliation responses before they can grant retry authority.
+durability and promotion rules. A useful next increment is an adapter that derives these proof fields
+from a real datastore's consensus or write-ahead-log metadata and alerts when its configured
+watermark falls behind.
