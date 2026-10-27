@@ -223,6 +223,7 @@ src/reconciliation.py          authenticated unknown-outcome receipts
 src/reconciliation_adapter.py  authoritative downstream status-to-receipt boundary
 src/http_reconciliation_provider.py  bounded mTLS JSON provider adapter
 tools/mtls_reconciliation_sandbox.py disposable live-TLS fault-injection endpoint
+tools/replicated_status_model.py deterministic acknowledged-write failover model
 docs/retry-authorization.md    signed no-commit decisions and retry threat model
 docs/ledger-observability.md    key-free gauges, durable counters and alerting boundary
 docs/authoritative-reconciliation.md  provider contract, deadlines and trust boundary
@@ -246,6 +247,7 @@ GitHub Actions validates the full public engineering surface:
 - key-free ledger gauges and atomic unknown/retry/exhaustion counters;
 - authoritative committed/not-committed/pending reconciliation decisions;
 - pinned mTLS provider requests and fail-closed HTTP/JSON response validation;
+- replica-gated reconciliation commits and stale-promotion fault injection over live mTLS;
 - live CA/server/client certificate generation, mutual-TLS handshake and timeout-after-observation;
 - execution budget handling;
 - trace evaluation;

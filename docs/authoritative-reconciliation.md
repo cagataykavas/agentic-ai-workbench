@@ -132,7 +132,31 @@ The CI integration contract proves three security-relevant paths with real socke
 - the sandbox can observe a request before delaying its reply past the socket timeout, and the
   provider returns no success or retry authority for that ambiguous result.
 
-This harness validates transport authentication and the fail-closed client deadline. It does not
-emulate a replicated database or prove linearizable reads. The next fault-injection increment should
-place a primary/replica state model behind this endpoint and quantify stale-read exposure before
-choosing synchronous replication or a strongly consistent status backend.
+## Replicated-state failover experiment
+
+`tools.replicated_status_model.ReplicatedStatusModel` can back the same live-mTLS endpoint with a
+deterministic primary and replica. A commit becomes visible on the primary immediately, while
+`replicate_all()` is the only event that advances the replica. `promote_replica()` then discards
+primary-only records, reproducing a stale promotion without sleeps, process races or an external
+database.
+
+The model makes two materially different policies executable:
+
+1. A local acknowledgement (`required_replica_acknowledgements=0`) returns evidence immediately.
+   Promotion before replication loses the record, so the authoritative lookup reports
+   `not_committed`. Turning that negative observation into retry authority could duplicate the
+   already-performed external side effect.
+2. A replica-gated acknowledgement (`required_replica_acknowledgements=1`) fails closed until the
+   record reaches the replica. Repeating the commit with the same cryptographic operation token is
+   idempotent, returns the original sequence, and survives promotion.
+
+Commit evidence contains the authority epoch, sequence, acknowledged-replica count and only a
+SHA-256 commitment to the operation token. A different token or output cannot take over an existing
+claim identity. Tests exercise both policies through the real TLS adapter, so transport and storage
+fault boundaries are evaluated together.
+
+This remains a deterministic two-node state model, not a Redis/PostgreSQL consensus implementation.
+It does not simulate split brain, replica persistence, partial log replay, network reordering or
+quorum membership changes. Production deployments must validate the chosen datastore's actual
+durability and promotion rules. The next increment should bind a minimum durable sequence or quorum
+proof to negative reconciliation responses before they can grant retry authority.

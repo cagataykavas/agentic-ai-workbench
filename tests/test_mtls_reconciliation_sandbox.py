@@ -14,6 +14,10 @@ from src.reconciliation_adapter import (
     ReconciliationUnavailableError,
 )
 from tools.mtls_reconciliation_sandbox import MtlsReconciliationSandbox, SandboxScenario
+from tools.replicated_status_model import (
+    ReplicatedStatusModel,
+    ReplicationAcknowledgementUnavailable,
+)
 
 KEY = "write:request-7"
 REQUEST_SHA256 = "a" * 64
@@ -203,3 +207,62 @@ def test_timeout_after_request_is_observed_remains_fail_closed(
             time.sleep(0.005)
         assert len(sandbox.captured_requests) == 1
         assert sandbox.captured_requests[0].document["key"] == KEY
+
+
+def test_live_lookup_exposes_primary_only_commit_loss_after_failover(
+    certificates: dict[str, Path],
+) -> None:
+    model = ReplicatedStatusModel()
+    evidence = model.commit(
+        QUERY,
+        {"payment_id": "p-7"},
+        operation_token="b" * 64,
+    )
+    model.promote_replica()
+
+    with MtlsReconciliationSandbox(
+        provider_id="payments-primary",
+        server_cert_file=certificates["server_cert"],
+        server_key_file=certificates["server_key"],
+        client_ca_file=certificates["ca"],
+        status_model=model,
+    ) as sandbox:
+        observation = _provider(certificates, sandbox.endpoint).lookup(QUERY, timeout_seconds=1)
+
+    assert evidence.replica_acknowledgements == 0
+    assert observation.outcome is DownstreamOutcome.NOT_COMMITTED
+    assert observation.output is None
+
+
+def test_live_lookup_preserves_replica_acknowledged_commit_after_failover(
+    certificates: dict[str, Path],
+) -> None:
+    model = ReplicatedStatusModel()
+    with pytest.raises(ReplicationAcknowledgementUnavailable):
+        model.commit(
+            QUERY,
+            {"payment_id": "p-7"},
+            operation_token="b" * 64,
+            required_replica_acknowledgements=1,
+        )
+    model.replicate_all()
+    evidence = model.commit(
+        QUERY,
+        {"payment_id": "p-7"},
+        operation_token="b" * 64,
+        required_replica_acknowledgements=1,
+    )
+    model.promote_replica()
+
+    with MtlsReconciliationSandbox(
+        provider_id="payments-primary",
+        server_cert_file=certificates["server_cert"],
+        server_key_file=certificates["server_key"],
+        client_ca_file=certificates["ca"],
+        status_model=model,
+    ) as sandbox:
+        observation = _provider(certificates, sandbox.endpoint).lookup(QUERY, timeout_seconds=1)
+
+    assert evidence.replica_acknowledgements == 1
+    assert observation.outcome is DownstreamOutcome.COMMITTED
+    assert observation.output == {"payment_id": "p-7"}

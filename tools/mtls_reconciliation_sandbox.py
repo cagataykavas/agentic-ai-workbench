@@ -11,7 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Self
 
-from src.reconciliation_adapter import DownstreamOutcome
+from src.reconciliation_adapter import DownstreamOutcome, ReconciliationQuery
+from tools.replicated_status_model import ReplicatedStatusModel
 
 _MAX_REQUEST_BYTES = 4_096
 _EXPECTED_REQUEST_FIELDS = {
@@ -73,12 +74,16 @@ class MtlsReconciliationSandbox:
         server_cert_file: str | Path,
         server_key_file: str | Path,
         client_ca_file: str | Path,
-        scenario: SandboxScenario,
+        scenario: SandboxScenario | None = None,
+        status_model: ReplicatedStatusModel | None = None,
     ) -> None:
         if not provider_id or len(provider_id) > 64:
             raise ValueError("provider_id must be 1-64 characters")
         self.provider_id = provider_id
+        if (scenario is None) == (status_model is None):
+            raise ValueError("provide exactly one of scenario or status_model")
         self.scenario = scenario
+        self.status_model = status_model
         self._captured: list[CapturedRequest] = []
         self._capture_lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -129,12 +134,28 @@ class MtlsReconciliationSandbox:
                 with sandbox._capture_lock:
                     sandbox._captured.append(captured)
 
-                time.sleep(float(sandbox.scenario.response_delay_seconds))
+                query = ReconciliationQuery(
+                    key=document["key"],
+                    request_sha256=document["request_sha256"],
+                    fencing_token=document["fencing_token"],
+                )
+                if sandbox.status_model is not None:
+                    model_observation = sandbox.status_model.observe(query)
+                    outcome = model_observation.outcome
+                    output = model_observation.output
+                    response_delay_seconds = 0.0
+                else:
+                    assert sandbox.scenario is not None
+                    outcome = sandbox.scenario.outcome
+                    output = sandbox.scenario.output
+                    response_delay_seconds = sandbox.scenario.response_delay_seconds
+
+                time.sleep(float(response_delay_seconds))
                 response_document = {
                     **document,
                     "observed_at_ms": received_at_ms,
-                    "outcome": sandbox.scenario.outcome.value,
-                    "output": dict(sandbox.scenario.output) if sandbox.scenario.output is not None else None,
+                    "outcome": outcome.value,
+                    "output": dict(output) if output is not None else None,
                     "provider_id": sandbox.provider_id,
                 }
                 payload = json.dumps(
