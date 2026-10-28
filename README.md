@@ -100,6 +100,10 @@ policy, and `pending` produces no authority. Late, stale, under-proven, contradi
 provider responses fail closed. A standard-library HTTPS adapter pins the endpoint, builds a mutually
 authenticated TLS context from CA/client key material, forwards the coordinator deadline to the
 socket, bounds every response read and accepts only strict UTF-8 JSON with the documented schema.
+For deployments that keep claim state in PostgreSQL, `PostgresWalStatusProvider` instead reads the
+exact claim and a protected authority epoch/sequence in one read-only snapshot. It refuses standbys
+and primaries below the controller's minimum WAL watermark, and derives replica evidence only from
+synchronous replicas that have replayed that watermark.
 
 This is useful for agent systems because transport retries, duplicated messages and repeated model plans should not automatically duplicate downstream writes.
 
@@ -223,6 +227,7 @@ src/sqlite_ledger.py            restart-safe SQLite idempotency and operational 
 src/reconciliation.py          authenticated unknown-outcome receipts
 src/reconciliation_adapter.py  authoritative downstream status-to-receipt boundary
 src/http_reconciliation_provider.py  bounded mTLS JSON provider adapter
+src/postgres_reconciliation_provider.py  PostgreSQL primary/WAL reconciliation adapter
 tools/mtls_reconciliation_sandbox.py disposable live-TLS fault-injection endpoint
 tools/replicated_status_model.py deterministic acknowledged-write failover model
 docs/retry-authorization.md    signed no-commit decisions and retry threat model
@@ -250,6 +255,7 @@ GitHub Actions validates the full public engineering surface:
 - pinned mTLS provider requests and fail-closed HTTP/JSON response validation;
 - replica-gated reconciliation commits, stale-promotion fault injection and proof-gated negative
   decisions over live mTLS;
+- PostgreSQL primary-role, WAL-watermark and snapshot-consistent negative-proof derivation;
 - live CA/server/client certificate generation, mutual-TLS handshake and timeout-after-observation;
 - execution budget handling;
 - trace evaluation;

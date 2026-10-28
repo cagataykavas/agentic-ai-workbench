@@ -10,7 +10,8 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.12"]
+postgres = ["psycopg[binary]>=3.2,<4"]
+dev = ["pytest>=8.0", "ruff>=0.12", "psycopg[binary]>=3.2,<4"]
 
 [tool.setuptools.packages.find]
 include = ["src*"]

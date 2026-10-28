@@ -144,6 +144,63 @@ prove that the remote service reported a truthful epoch, sequence or replica cou
 derive those fields from protected datastore metadata, keep policy watermarks current and test
 ambiguous commits and replica lag against the real persistence system.
 
+## PostgreSQL primary/WAL adapter
+
+`PostgresWalStatusProvider` removes the remote service's ability to invent negative-proof fields.
+It reads the claim, controller-owned authority epoch and durable sequence, PostgreSQL recovery role,
+local WAL flush position, and synchronous-replica replay state in one `REPEATABLE READ READ ONLY`
+transaction. Install the optional driver with `agentic-ai-workbench[postgres]`:
+
+```python
+from src.postgres_reconciliation_provider import PostgresWalStatusProvider
+
+provider = PostgresWalStatusProvider(
+    provider_id="payments-postgres",
+    dsn=postgres_dsn_from_secret_manager,
+    schema="agent_runtime",
+)
+```
+
+The adapter expects two application-owned tables. Use migrations and database roles to prevent the
+reconciliation identity from modifying them:
+
+```sql
+CREATE TABLE agent_runtime.agent_reconciliation_authority (
+    singleton boolean PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    authority_epoch bigint NOT NULL CHECK (authority_epoch > 0),
+    durable_sequence bigint NOT NULL CHECK (durable_sequence >= 0),
+    minimum_wal_lsn pg_lsn NOT NULL
+);
+
+CREATE TABLE agent_runtime.agent_reconciliation_claims (
+    idempotency_key text PRIMARY KEY,
+    request_sha256 text NOT NULL,
+    fencing_token bigint NOT NULL,
+    status text NOT NULL CHECK (status IN ('pending', 'committed')),
+    output jsonb
+);
+```
+
+The downstream writer must serialize claim commits with the singleton authority row and advance
+`durable_sequence` in the same transaction. The failover controller advances `authority_epoch` and
+sets `minimum_wal_lsn` to the WAL position every promoted primary must contain. The adapter rejects
+standbys, missing or duplicate authority state, a local flush LSN below that watermark, malformed
+claim identity/state, and ambiguous database responses. A missing claim produces `not_committed`
+only after these checks. Synchronous acknowledgements count only `sync`/`quorum` replicas whose
+`replay_lsn` has reached the controller watermark.
+
+Identifiers are restricted before being interpolated; the idempotency key remains a query
+parameter. Statement and idle-in-transaction deadlines are applied from the coordinator's lookup
+budget. Database/DSN diagnostics are retained only as exception causes and are not copied into the
+stable public error. The CI contract runs the provider against a real PostgreSQL primary in addition
+to fail-closed protocol tests.
+
+This adapter does not turn PostgreSQL streaming replication into consensus. Correctness still
+depends on the writer serialization rule, a rollback-protected controller epoch, a trustworthy
+minimum WAL watermark, downstream fencing enforcement, and PostgreSQL role permissions. A WAL
+watermark rejection should increment a low-cardinality readiness alert; it must not be bypassed to
+restore availability. The adapter does not perform promotion or mutate controller state.
+
 ## Disposable live-mTLS sandbox
 
 `tools.mtls_reconciliation_sandbox.MtlsReconciliationSandbox` provides a loopback-only HTTPS
@@ -191,9 +248,9 @@ replica_acknowledgements=0)` and that a coordinator requiring durable sequence `
 authority. The same proof is included in the privacy-reduced observation digest for audit
 correlation.
 
-This remains a deterministic two-node state model, not a Redis/PostgreSQL consensus implementation.
+This remains a deterministic two-node state model, not a consensus implementation.
 It does not simulate split brain, replica persistence, partial log replay, network reordering or
 quorum membership changes. Production deployments must validate the chosen datastore's actual
-durability and promotion rules. A useful next increment is an adapter that derives these proof fields
-from a real datastore's consensus or write-ahead-log metadata and alerts when its configured
-watermark falls behind.
+durability and promotion rules. The PostgreSQL adapter above closes the metadata-derivation gap for
+one documented schema; the next increment should export its stable rejection reasons and WAL margin
+as bounded operational metrics without exposing DSNs, claim keys or replication topology.
