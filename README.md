@@ -103,7 +103,9 @@ socket, bounds every response read and accepts only strict UTF-8 JSON with the d
 For deployments that keep claim state in PostgreSQL, `PostgresWalStatusProvider` instead reads the
 exact claim and a protected authority epoch/sequence in one read-only snapshot. It refuses standbys
 and primaries below the controller's minimum WAL watermark, and derives replica evidence only from
-synchronous replicas that have replayed that watermark.
+synchronous replicas that have replayed that watermark. Its thread-safe metrics snapshot exports
+only fixed outcome/rejection counters and positive/negative WAL-margin readiness gauges—never DSNs, claim
+identities, raw LSNs or replica identities.
 
 This is useful for agent systems because transport retries, duplicated messages and repeated model plans should not automatically duplicate downstream writes.
 

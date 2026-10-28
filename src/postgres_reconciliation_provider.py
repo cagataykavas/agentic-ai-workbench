@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Protocol, Self
 
 from src.reconciliation_adapter import (
@@ -19,6 +22,57 @@ _PROVIDER_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _LSN_PATTERN = re.compile(r"[0-9A-F]+/[0-9A-F]+")
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _MAX_REPLICA_ACKNOWLEDGEMENTS = 32
+_REJECTION_REASONS = (
+    "not_primary",
+    "wal_watermark_not_reached",
+    "malformed_snapshot",
+    "malformed_authority",
+    "missing_or_ambiguous",
+    "claim_identity_mismatch",
+    "claim_state_malformed",
+    "database_error",
+)
+
+
+class _ProviderRejected(ReconciliationUnavailableError):
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        *,
+        wal_margin_bytes: int | None = None,
+    ) -> None:
+        if reason not in _REJECTION_REASONS:
+            raise ValueError("unsupported PostgreSQL rejection reason")
+        self.metric_reason = reason
+        self.wal_margin_bytes = wal_margin_bytes
+        super().__init__(message)
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresWalStatusMetrics:
+    """Bounded, identity-free provider metrics suitable for export."""
+
+    lookup_total: int
+    lookup_success_total: int
+    outcome_totals: Mapping[str, int]
+    rejection_totals: Mapping[str, int]
+    latest_wal_margin_bytes: int | None
+    minimum_wal_margin_bytes: int | None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "lookup_total": self.lookup_total,
+            "lookup_success_total": self.lookup_success_total,
+            "outcome_totals": dict(self.outcome_totals),
+            "rejection_totals": dict(self.rejection_totals),
+            "latest_wal_margin_bytes": self.latest_wal_margin_bytes,
+            "minimum_wal_margin_bytes": self.minimum_wal_margin_bytes,
+            "wal_ready": (
+                None if self.latest_wal_margin_bytes is None else self.latest_wal_margin_bytes >= 0
+            ),
+        }
 
 
 class _Cursor(Protocol):
@@ -110,6 +164,54 @@ class PostgresWalStatusProvider:
             f"{quoted_schema}.{quoted_claim_table}",
             f"{quoted_schema}.{quoted_authority_table}",
         )
+        self._metrics_lock = threading.Lock()
+        self._lookup_total = 0
+        self._lookup_success_total = 0
+        self._outcome_totals = {outcome.value: 0 for outcome in DownstreamOutcome}
+        self._rejection_totals = {reason: 0 for reason in _REJECTION_REASONS}
+        self._latest_wal_margin_bytes: int | None = None
+        self._minimum_wal_margin_bytes: int | None = None
+
+    def metrics_snapshot(self) -> PostgresWalStatusMetrics:
+        """Return fixed-cardinality counters and WAL readiness gauges."""
+
+        with self._metrics_lock:
+            return PostgresWalStatusMetrics(
+                lookup_total=self._lookup_total,
+                lookup_success_total=self._lookup_success_total,
+                outcome_totals=MappingProxyType(dict(self._outcome_totals)),
+                rejection_totals=MappingProxyType(dict(self._rejection_totals)),
+                latest_wal_margin_bytes=self._latest_wal_margin_bytes,
+                minimum_wal_margin_bytes=self._minimum_wal_margin_bytes,
+            )
+
+    def _observe_margin(self, wal_margin_bytes: int | None) -> None:
+        if wal_margin_bytes is None:
+            return
+        self._latest_wal_margin_bytes = wal_margin_bytes
+        if self._minimum_wal_margin_bytes is None or wal_margin_bytes < self._minimum_wal_margin_bytes:
+            self._minimum_wal_margin_bytes = wal_margin_bytes
+
+    def _record_success(
+        self,
+        outcome: DownstreamOutcome,
+        wal_margin_bytes: int,
+    ) -> None:
+        with self._metrics_lock:
+            self._lookup_total += 1
+            self._lookup_success_total += 1
+            self._outcome_totals[outcome.value] += 1
+            self._observe_margin(wal_margin_bytes)
+
+    def _record_rejection(
+        self,
+        reason: str,
+        wal_margin_bytes: int | None = None,
+    ) -> None:
+        with self._metrics_lock:
+            self._lookup_total += 1
+            self._rejection_totals[reason] += 1
+            self._observe_margin(wal_margin_bytes)
 
     @staticmethod
     def _build_query(claim_table: str, authority_table: str) -> str:
@@ -170,9 +272,12 @@ LEFT JOIN claim ON TRUE
         self,
         row: tuple[object, ...],
         query: ReconciliationQuery,
-    ) -> DownstreamObservation:
+    ) -> tuple[DownstreamObservation, int]:
         if len(row) != 11:
-            raise ReconciliationUnavailableError("PostgreSQL reconciliation row is malformed")
+            raise _ProviderRejected(
+                "malformed_snapshot",
+                "PostgreSQL reconciliation row is malformed",
+            )
         (
             in_recovery,
             flush_lsn_text,
@@ -187,11 +292,22 @@ LEFT JOIN claim ON TRUE
             output,
         ) = row
         if in_recovery is not False:
-            raise ReconciliationUnavailableError("PostgreSQL authority is not the primary")
-        flush_lsn = _lsn_to_integer(flush_lsn_text, "flush LSN")
-        minimum_wal_lsn = _lsn_to_integer(minimum_wal_lsn_text, "minimum WAL LSN")
-        if flush_lsn < minimum_wal_lsn:
-            raise ReconciliationUnavailableError("PostgreSQL WAL watermark has not been reached")
+            raise _ProviderRejected(
+                "not_primary",
+                "PostgreSQL authority is not the primary",
+            )
+        try:
+            flush_lsn = _lsn_to_integer(flush_lsn_text, "flush LSN")
+            minimum_wal_lsn = _lsn_to_integer(minimum_wal_lsn_text, "minimum WAL LSN")
+        except ReconciliationUnavailableError as exc:
+            raise _ProviderRejected("malformed_snapshot", exc.reason) from exc
+        wal_margin_bytes = flush_lsn - minimum_wal_lsn
+        if wal_margin_bytes < 0:
+            raise _ProviderRejected(
+                "wal_watermark_not_reached",
+                "PostgreSQL WAL watermark has not been reached",
+                wal_margin_bytes=wal_margin_bytes,
+            )
         if (
             type(authority_epoch) is not int
             or not 0 < authority_epoch <= _MAX_SQLITE_INTEGER
@@ -202,7 +318,11 @@ LEFT JOIN claim ON TRUE
             or type(replica_acknowledgements) is not int
             or not 0 <= replica_acknowledgements <= _MAX_REPLICA_ACKNOWLEDGEMENTS
         ):
-            raise ReconciliationUnavailableError("PostgreSQL authority metadata is malformed")
+            raise _ProviderRejected(
+                "malformed_authority",
+                "PostgreSQL authority metadata is malformed",
+                wal_margin_bytes=wal_margin_bytes,
+            )
         negative_proof = NegativeDurabilityProof(
             authority_epoch=authority_epoch,
             durable_sequence=durable_sequence,
@@ -210,17 +330,24 @@ LEFT JOIN claim ON TRUE
         )
         claim_values = (request_sha256, fencing_token, status, output)
         if claim_values == (None, None, None, None):
-            return DownstreamObservation(
-                provider_id=self.provider_id,
-                outcome=DownstreamOutcome.NOT_COMMITTED,
-                key=query.key,
-                request_sha256=query.request_sha256,
-                fencing_token=query.fencing_token,
-                observed_at_ms=observed_at_ms,
-                negative_proof=negative_proof,
+            return (
+                DownstreamObservation(
+                    provider_id=self.provider_id,
+                    outcome=DownstreamOutcome.NOT_COMMITTED,
+                    key=query.key,
+                    request_sha256=query.request_sha256,
+                    fencing_token=query.fencing_token,
+                    observed_at_ms=observed_at_ms,
+                    negative_proof=negative_proof,
+                ),
+                wal_margin_bytes,
             )
         if request_sha256 != query.request_sha256 or fencing_token != query.fencing_token:
-            raise ReconciliationUnavailableError("PostgreSQL claim identity mismatch")
+            raise _ProviderRejected(
+                "claim_identity_mismatch",
+                "PostgreSQL claim identity mismatch",
+                wal_margin_bytes=wal_margin_bytes,
+            )
         if status == DownstreamOutcome.PENDING.value and output is None:
             outcome = DownstreamOutcome.PENDING
             parsed_output = None
@@ -230,20 +357,35 @@ LEFT JOIN claim ON TRUE
                 try:
                     output = json.loads(output)
                 except json.JSONDecodeError as exc:
-                    raise ReconciliationUnavailableError("PostgreSQL committed output is malformed") from exc
+                    raise _ProviderRejected(
+                        "claim_state_malformed",
+                        "PostgreSQL committed output is malformed",
+                        wal_margin_bytes=wal_margin_bytes,
+                    ) from exc
             if not isinstance(output, Mapping):
-                raise ReconciliationUnavailableError("PostgreSQL committed output is malformed")
+                raise _ProviderRejected(
+                    "claim_state_malformed",
+                    "PostgreSQL committed output is malformed",
+                    wal_margin_bytes=wal_margin_bytes,
+                )
             parsed_output = dict(output)
         else:
-            raise ReconciliationUnavailableError("PostgreSQL claim state is malformed")
-        return DownstreamObservation(
-            provider_id=self.provider_id,
-            outcome=outcome,
-            key=query.key,
-            request_sha256=query.request_sha256,
-            fencing_token=query.fencing_token,
-            observed_at_ms=observed_at_ms,
-            output=parsed_output,
+            raise _ProviderRejected(
+                "claim_state_malformed",
+                "PostgreSQL claim state is malformed",
+                wal_margin_bytes=wal_margin_bytes,
+            )
+        return (
+            DownstreamObservation(
+                provider_id=self.provider_id,
+                outcome=outcome,
+                key=query.key,
+                request_sha256=query.request_sha256,
+                fencing_token=query.fencing_token,
+                observed_at_ms=observed_at_ms,
+                output=parsed_output,
+            ),
+            wal_margin_bytes,
         )
 
     def lookup(
@@ -272,13 +414,19 @@ LEFT JOIN claim ON TRUE
                 cursor.execute(self._query, (query.key,))
                 rows = cursor.fetchall()
             if len(rows) != 1:
-                raise ReconciliationUnavailableError("PostgreSQL authority snapshot is missing or ambiguous")
-            observation = self._parse_row(rows[0], query)
+                raise _ProviderRejected(
+                    "missing_or_ambiguous",
+                    "PostgreSQL authority snapshot is missing or ambiguous",
+                )
+            observation, wal_margin_bytes = self._parse_row(rows[0], query)
             connection.commit()
+            self._record_success(observation.outcome, wal_margin_bytes)
             return observation
-        except ReconciliationUnavailableError:
+        except _ProviderRejected as exc:
+            self._record_rejection(exc.metric_reason, exc.wal_margin_bytes)
             raise
         except Exception as exc:
+            self._record_rejection("database_error")
             raise ReconciliationUnavailableError("PostgreSQL lookup failed") from exc
         finally:
             if connection is not None:

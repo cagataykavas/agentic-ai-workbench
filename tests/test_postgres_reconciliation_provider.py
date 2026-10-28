@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Self
 
@@ -304,6 +305,141 @@ def test_timeout_is_bounded_and_rounded_up_to_one_millisecond() -> None:
     assert connection.cursor_instance.executions[1][1] == ("1ms",)
     with pytest.raises(ValueError, match="timeout_seconds"):
         provider.lookup(QUERY, timeout_seconds=True)
+
+
+def test_metrics_snapshot_starts_bounded_and_identity_free() -> None:
+    provider, _, _ = provider_for([row()])
+
+    snapshot = provider.metrics_snapshot()
+
+    assert snapshot.as_dict() == {
+        "schema_version": 1,
+        "lookup_total": 0,
+        "lookup_success_total": 0,
+        "outcome_totals": {
+            "committed": 0,
+            "not_committed": 0,
+            "pending": 0,
+        },
+        "rejection_totals": {
+            "not_primary": 0,
+            "wal_watermark_not_reached": 0,
+            "malformed_snapshot": 0,
+            "malformed_authority": 0,
+            "missing_or_ambiguous": 0,
+            "claim_identity_mismatch": 0,
+            "claim_state_malformed": 0,
+            "database_error": 0,
+        },
+        "latest_wal_margin_bytes": None,
+        "minimum_wal_margin_bytes": None,
+        "wal_ready": None,
+    }
+    rendered = str(snapshot.as_dict())
+    assert KEY not in rendered
+    assert REQUEST_SHA256 not in rendered
+    assert "postgresql://" not in rendered
+
+
+def test_metrics_track_outcome_and_positive_or_negative_wal_margin() -> None:
+    provider, connection, _ = provider_for([row()])
+
+    provider.lookup(QUERY, timeout_seconds=1)
+    connection.cursor_instance.rows = [row(flush_lsn="0/FF", minimum_wal_lsn="0/100")]
+    with pytest.raises(ReconciliationUnavailableError, match="watermark"):
+        provider.lookup(QUERY, timeout_seconds=1)
+    snapshot = provider.metrics_snapshot()
+
+    assert snapshot.lookup_total == 2
+    assert snapshot.lookup_success_total == 1
+    assert snapshot.outcome_totals["not_committed"] == 1
+    assert snapshot.rejection_totals["wal_watermark_not_reached"] == 1
+    assert snapshot.latest_wal_margin_bytes == -1
+    assert snapshot.minimum_wal_margin_bytes == -1
+    assert snapshot.as_dict()["wal_ready"] is False
+    assert "0/100" not in str(snapshot.as_dict())
+
+
+@pytest.mark.parametrize(
+    ("rows", "reason"),
+    [
+        ([row(in_recovery=True, flush_lsn=None)], "not_primary"),
+        ([row(flush_lsn="bad-lsn")], "malformed_snapshot"),
+        ([row(authority_epoch=True)], "malformed_authority"),
+        ([], "missing_or_ambiguous"),
+        (
+            [row(request_sha256="b" * 64, fencing_token=1, status="pending")],
+            "claim_identity_mismatch",
+        ),
+        (
+            [
+                row(
+                    request_sha256=REQUEST_SHA256,
+                    fencing_token=1,
+                    status="committed",
+                    output=None,
+                )
+            ],
+            "claim_state_malformed",
+        ),
+    ],
+)
+def test_metrics_use_only_stable_rejection_reasons(rows: list[tuple[object, ...]], reason: str) -> None:
+    provider, _, _ = provider_for(rows)
+
+    with pytest.raises(ReconciliationUnavailableError):
+        provider.lookup(QUERY, timeout_seconds=1)
+
+    snapshot = provider.metrics_snapshot()
+    assert snapshot.lookup_total == 1
+    assert snapshot.lookup_success_total == 0
+    assert snapshot.rejection_totals[reason] == 1
+    assert sum(snapshot.rejection_totals.values()) == 1
+
+
+def test_database_failure_has_one_safe_reason_without_diagnostic() -> None:
+    def failing_factory(dsn: str, timeout_seconds: float) -> FakeConnection:
+        raise RuntimeError(f"private diagnostic {dsn} {timeout_seconds}")
+
+    provider = PostgresWalStatusProvider(
+        provider_id="payments-postgres",
+        dsn="postgresql://user:secret@authority.invalid/reconciliation",
+        connection_factory=failing_factory,
+    )
+
+    with pytest.raises(ReconciliationUnavailableError):
+        provider.lookup(QUERY, timeout_seconds=1)
+
+    metrics = provider.metrics_snapshot().as_dict()
+    assert metrics["rejection_totals"]["database_error"] == 1  # type: ignore[index]
+    assert "secret" not in str(metrics)
+    assert "authority.invalid" not in str(metrics)
+
+
+def test_metrics_are_thread_safe_and_snapshot_mappings_are_immutable() -> None:
+    def factory(dsn: str, timeout_seconds: float) -> FakeConnection:
+        return FakeConnection([row()])
+
+    provider = PostgresWalStatusProvider(
+        provider_id="payments-postgres",
+        dsn="postgresql://authority.invalid/reconciliation",
+        connection_factory=factory,
+    )
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        observations = list(
+            pool.map(
+                lambda _: provider.lookup(QUERY, timeout_seconds=1),
+                range(64),
+            )
+        )
+
+    assert len(observations) == 64
+    snapshot = provider.metrics_snapshot()
+    assert snapshot.lookup_total == snapshot.lookup_success_total == 64
+    assert snapshot.outcome_totals["not_committed"] == 64
+    with pytest.raises(TypeError):
+        snapshot.outcome_totals["not_committed"] = 0  # type: ignore[index]
 
 
 @pytest.mark.skipif(
