@@ -195,6 +195,34 @@ budget. Database/DSN diagnostics are retained only as exception causes and are n
 stable public error. The CI contract runs the provider against a real PostgreSQL primary in addition
 to fail-closed protocol tests.
 
+### Bounded provider observability
+
+`metrics_snapshot()` returns a thread-safe, fixed-cardinality view that can be translated directly
+into metrics without turning claim or topology data into labels:
+
+```python
+metrics = provider.metrics_snapshot().as_dict()
+emit_metrics(metrics)
+```
+
+The snapshot contains total/successful lookups, fixed outcome counts, eight stable rejection
+counts, the latest positive/negative WAL margin and the minimum margin observed since process start. `wal_ready`
+is `true` at or above the controller watermark, `false` below it, and `null` until a parseable primary
+snapshot has supplied both LSNs. The margin is the byte difference between the local flush position
+and required minimum; raw LSNs are never retained or emitted.
+
+Rejection reasons are bounded to `not_primary`, `wal_watermark_not_reached`, `malformed_snapshot`,
+`malformed_authority`, `missing_or_ambiguous`, `claim_identity_mismatch`,
+`claim_state_malformed`, and `database_error`. Arbitrary PostgreSQL diagnostics cannot create metric
+labels. The snapshot also omits DSNs, provider IDs, claim keys, request hashes, fencing tokens,
+authority values and replica identities/counts. Copies are immutable, while counters and readiness
+gauges update under one process-local lock so concurrent lookups are not lost.
+
+These counters reset when the process restarts and do not replace durable audit receipts. Alert on
+non-zero watermark/not-primary rejection rates and negative WAL margin, but do not bypass the gate to
+restore availability. Exporters should preserve the fixed reason set rather than adding exception
+messages as labels.
+
 This adapter does not turn PostgreSQL streaming replication into consensus. Correctness still
 depends on the writer serialization rule, a rollback-protected controller epoch, a trustworthy
 minimum WAL watermark, downstream fencing enforcement, and PostgreSQL role permissions. A WAL
@@ -252,5 +280,6 @@ This remains a deterministic two-node state model, not a consensus implementatio
 It does not simulate split brain, replica persistence, partial log replay, network reordering or
 quorum membership changes. Production deployments must validate the chosen datastore's actual
 durability and promotion rules. The PostgreSQL adapter above closes the metadata-derivation gap for
-one documented schema; the next increment should export its stable rejection reasons and WAL margin
-as bounded operational metrics without exposing DSNs, claim keys or replication topology.
+one documented schema and exports bounded readiness metrics. A next increment should bind the
+provider's minimum accepted authority epoch to a rollback-protected controller checkpoint and prove
+that stale process configuration cannot authorize a retry after failover.
