@@ -233,6 +233,7 @@ src/reconciliation_adapter.py  authoritative downstream status-to-receipt bounda
 src/http_reconciliation_provider.py  bounded mTLS JSON provider adapter
 src/postgres_reconciliation_provider.py  PostgreSQL primary/WAL reconciliation adapter
 src/authority_epoch_checkpoint.py  signed, externally anchored controller epoch source
+src/postgres_authority_checkpoint_store.py  serializable checkpoint CAS and atomic loader
 tools/mtls_reconciliation_sandbox.py disposable live-TLS fault-injection endpoint
 tools/replicated_status_model.py deterministic acknowledged-write failover model
 docs/retry-authorization.md    signed no-commit decisions and retry threat model
