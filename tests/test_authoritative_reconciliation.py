@@ -4,6 +4,11 @@ from dataclasses import replace
 
 import pytest
 
+from src.authority_epoch_checkpoint import (
+    SignedAuthorityEpochSource,
+    dump_authority_epoch_checkpoint,
+    sign_authority_epoch_checkpoint,
+)
 from src.reconciliation import (
     ReceiptAuthenticator,
     ReconciliationReceipt,
@@ -89,12 +94,14 @@ def coordinator(
     *,
     monotonic=lambda: 1.0,
     negative_observation_policy: NegativeObservationPolicy | None = None,
+    authority_epoch_source=None,
 ) -> AuthoritativeReconciliationCoordinator:
     return AuthoritativeReconciliationCoordinator(
         provider,
         authenticator(now),
         negative_observation_policy=negative_observation_policy
         or NegativeObservationPolicy(required_replica_acknowledgements=1),
+        authority_epoch_source=authority_epoch_source,
         lookup_timeout_seconds=0.25,
         max_observation_age_seconds=10,
         max_future_skew_seconds=1,
@@ -127,6 +134,105 @@ def test_not_committed_observation_issues_bounded_retry_authorization() -> None:
     assert decision.outcome is DownstreamOutcome.NOT_COMMITTED
     assert isinstance(decision.receipt, RetryAuthorizationReceipt)
     assert reconciler.authenticator.verify_retry_authorization(decision.receipt) == 2_500
+
+
+def test_live_epoch_checkpoint_overrides_stale_process_policy_after_failover() -> None:
+    now = [100.0]
+    secret = b"controller-checkpoint-key-material"
+    active = sign_authority_epoch_checkpoint(
+        provider_id="payments-primary",
+        generation=1,
+        minimum_authority_epoch=1,
+        issued_at_ms=100_000,
+        key_id="current",
+        secret=secret,
+    )
+    state = [[dump_authority_epoch_checkpoint(active), active.digest]]
+    epoch_source = SignedAuthorityEpochSource(
+        provider_id="payments-primary",
+        checkpoint_loader=lambda: tuple(state[0]),
+        keyring={"current": secret},
+        clock=lambda: now[0],
+    )
+    stale_provider = Provider(
+        observation(
+            DownstreamOutcome.NOT_COMMITTED,
+            negative_proof=NegativeDurabilityProof(1, 0, 1),
+        )
+    )
+    reconciler = coordinator(
+        stale_provider,
+        now,
+        authority_epoch_source=epoch_source,
+    )
+    first = reconciler.reconcile(QUERY, retry_lease_seconds=3)
+    assert isinstance(first.receipt, RetryAuthorizationReceipt)
+
+    promoted = sign_authority_epoch_checkpoint(
+        provider_id="payments-primary",
+        generation=2,
+        minimum_authority_epoch=2,
+        issued_at_ms=100_000,
+        key_id="current",
+        secret=secret,
+    )
+    state[0] = [dump_authority_epoch_checkpoint(promoted), promoted.digest]
+
+    with pytest.raises(ReconciliationUnavailableError, match="controller epoch checkpoint"):
+        reconciler.reconcile(QUERY, retry_lease_seconds=3)
+
+
+def test_epoch_checkpoint_digest_is_bound_to_negative_observation() -> None:
+    now = [100.0]
+    secret = b"controller-checkpoint-key-material"
+
+    def decision(generation: int) -> str:
+        checkpoint = sign_authority_epoch_checkpoint(
+            provider_id="payments-primary",
+            generation=generation,
+            minimum_authority_epoch=1,
+            issued_at_ms=100_000,
+            key_id="current",
+            secret=secret,
+        )
+        epoch_source = SignedAuthorityEpochSource(
+            provider_id="payments-primary",
+            checkpoint_loader=lambda: (
+                dump_authority_epoch_checkpoint(checkpoint),
+                checkpoint.digest,
+            ),
+            keyring={"current": secret},
+            clock=lambda: now[0],
+        )
+        return coordinator(
+            Provider(observation(DownstreamOutcome.NOT_COMMITTED)),
+            now,
+            authority_epoch_source=epoch_source,
+        ).reconcile(QUERY, retry_lease_seconds=3).observation_sha256
+
+    assert decision(1) != decision(2)
+
+
+def test_epoch_checkpoint_failure_is_normalized_and_committed_path_is_independent() -> None:
+    class BrokenSource:
+        def current_requirement(self):
+            raise OSError("secret checkpoint diagnostic")
+
+    now = [100.0]
+    with pytest.raises(ReconciliationUnavailableError, match="checkpoint unavailable") as caught:
+        coordinator(
+            Provider(observation(DownstreamOutcome.NOT_COMMITTED)),
+            now,
+            authority_epoch_source=BrokenSource(),
+        ).reconcile(QUERY, retry_lease_seconds=3)
+    assert "secret" not in str(caught.value)
+
+    committed = coordinator(
+        Provider(observation(DownstreamOutcome.COMMITTED, output={"ok": True})),
+        now,
+        authority_epoch_source=BrokenSource(),
+    ).reconcile(QUERY, retry_lease_seconds=3)
+    assert isinstance(committed.receipt, ReconciliationReceipt)
 
 
 def test_not_committed_without_durability_proof_never_issues_retry_authority() -> None:

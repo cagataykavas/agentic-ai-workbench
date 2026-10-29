@@ -223,6 +223,47 @@ non-zero watermark/not-primary rejection rates and negative WAL margin, but do n
 restore availability. Exporters should preserve the fixed reason set rather than adding exception
 messages as labels.
 
+### Rollback-protected controller epoch
+
+A static `NegativeObservationPolicy.minimum_authority_epoch` can become stale when a long-running
+process survives failover. `SignedAuthorityEpochSource` closes that process-configuration gap by
+reloading a signed checkpoint immediately before each `not_committed` observation can authorize a
+retry:
+
+```python
+from src.authority_epoch_checkpoint import SignedAuthorityEpochSource
+
+epoch_source = SignedAuthorityEpochSource(
+    provider_id="payments-postgres",
+    checkpoint_loader=load_checkpoint_and_anchor_atomically,
+    keyring=checkpoint_verification_keys,
+)
+coordinator = AuthoritativeReconciliationCoordinator(
+    provider,
+    authenticator,
+    negative_observation_policy=negative_policy,
+    authority_epoch_source=epoch_source,
+)
+```
+
+The loader must return `(checkpoint_json, anchored_sha256)` from one strongly consistent control-
+plane read. The checkpoint binds the provider, monotonic generation, minimum accepted authority
+epoch, issue time and key ID under domain-separated HMAC-SHA256. The source rejects an anchor
+mismatch, invalid or retired key, stale/future document, generation regression and same-generation
+equivocation, and a minimum-epoch decrease even under a higher generation. Its digest is included in
+the privacy-reduced observation commitment.
+
+The checkpoint is read only for negative decisions; committed evidence can still resolve an unknown
+claim when the controller store is unavailable. Advancing the externally anchored checkpoint from
+epoch 1 to epoch 2 immediately prevents an unchanged process policy and epoch-1 database snapshot
+from issuing retry authority. Rolling back the JSON while retaining the epoch-2 anchor also fails
+closed.
+
+HMAC authenticity is not rollback protection by itself. The control-plane store must provide the
+head digest atomically with the document and protect that digest against rollback. The in-process
+generation watermark only detects regression during one process lifetime. The source does not
+allocate epochs, promote PostgreSQL, fence a former primary or implement distributed consensus.
+
 This adapter does not turn PostgreSQL streaming replication into consensus. Correctness still
 depends on the writer serialization rule, a rollback-protected controller epoch, a trustworthy
 minimum WAL watermark, downstream fencing enforcement, and PostgreSQL role permissions. A WAL
@@ -280,6 +321,6 @@ This remains a deterministic two-node state model, not a consensus implementatio
 It does not simulate split brain, replica persistence, partial log replay, network reordering or
 quorum membership changes. Production deployments must validate the chosen datastore's actual
 durability and promotion rules. The PostgreSQL adapter above closes the metadata-derivation gap for
-one documented schema and exports bounded readiness metrics. A next increment should bind the
-provider's minimum accepted authority epoch to a rollback-protected controller checkpoint and prove
-that stale process configuration cannot authorize a retry after failover.
+one documented schema, exports bounded readiness metrics and can consume the externally anchored
+controller epoch described above. A next increment should exercise checkpoint advancement and
+stale-primary fencing in a disposable PostgreSQL failover topology.
