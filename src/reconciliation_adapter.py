@@ -126,6 +126,19 @@ class AuthoritativeStatusProvider(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class AuthorityEpochRequirement:
+    """Dynamically loaded controller floor for negative retry evidence."""
+
+    provider_id: str
+    minimum_authority_epoch: int
+    checkpoint_sha256: str
+
+
+class AuthorityEpochSource(Protocol):
+    def current_requirement(self) -> AuthorityEpochRequirement: ...
+
+
+@dataclass(frozen=True, slots=True)
 class ReconciliationDecision:
     outcome: DownstreamOutcome
     provider_id: str
@@ -142,6 +155,7 @@ class AuthoritativeReconciliationCoordinator:
         authenticator: ReceiptAuthenticator,
         *,
         negative_observation_policy: NegativeObservationPolicy,
+        authority_epoch_source: AuthorityEpochSource | None = None,
         lookup_timeout_seconds: float = 2.0,
         max_observation_age_seconds: float = 30.0,
         max_future_skew_seconds: float = 2.0,
@@ -169,6 +183,7 @@ class AuthoritativeReconciliationCoordinator:
         self.provider = provider
         self.authenticator = authenticator
         self.negative_observation_policy = negative_observation_policy
+        self.authority_epoch_source = authority_epoch_source
         self.provider_id = provider_id
         self.lookup_timeout_seconds = float(lookup_timeout_seconds)
         self.max_observation_age_ms = math.floor(max_observation_age_seconds * 1_000)
@@ -278,6 +293,7 @@ class AuthoritativeReconciliationCoordinator:
         if observation.outcome is not DownstreamOutcome.COMMITTED and output is not None:
             raise ReconciliationUnavailableError("non-committed observation must not include output")
         negative_proof = self._canonical_negative_proof(observation.negative_proof)
+        checkpoint_sha256: str | None = None
         if observation.outcome is DownstreamOutcome.NOT_COMMITTED:
             if negative_proof is None:
                 raise ReconciliationUnavailableError(
@@ -288,6 +304,40 @@ class AuthoritativeReconciliationCoordinator:
                 raise ReconciliationUnavailableError(
                     "negative durability proof does not satisfy retry policy"
                 )
+            if self.authority_epoch_source is not None:
+                try:
+                    requirement = self.authority_epoch_source.current_requirement()
+                except Exception as exc:
+                    raise ReconciliationUnavailableError(
+                        "authority epoch checkpoint unavailable"
+                    ) from exc
+                if not isinstance(requirement, AuthorityEpochRequirement):
+                    raise ReconciliationUnavailableError(
+                        "authority epoch checkpoint is malformed"
+                    )
+                if requirement.provider_id != self.provider_id:
+                    raise ReconciliationUnavailableError(
+                        "authority epoch checkpoint provider mismatch"
+                    )
+                if (
+                    type(requirement.minimum_authority_epoch) is not int
+                    or not 0
+                    < requirement.minimum_authority_epoch
+                    <= _MAX_SQLITE_INTEGER
+                    or not isinstance(requirement.checkpoint_sha256, str)
+                    or _SHA256_PATTERN.fullmatch(requirement.checkpoint_sha256) is None
+                ):
+                    raise ReconciliationUnavailableError(
+                        "authority epoch checkpoint is malformed"
+                    )
+                if (
+                    observation.negative_proof.authority_epoch
+                    < requirement.minimum_authority_epoch
+                ):
+                    raise ReconciliationUnavailableError(
+                        "negative proof is below the controller epoch checkpoint"
+                    )
+                checkpoint_sha256 = requirement.checkpoint_sha256
         elif negative_proof is not None:
             raise ReconciliationUnavailableError(
                 "only not-committed observations may include a negative durability proof"
@@ -302,6 +352,7 @@ class AuthoritativeReconciliationCoordinator:
             "provider_id": observation.provider_id,
             "request_sha256": query.request_sha256,
             "schema_version": 2,
+            "authority_epoch_checkpoint_sha256": checkpoint_sha256,
         }
         encoded = json.dumps(
             document,
