@@ -232,10 +232,17 @@ retry:
 
 ```python
 from src.authority_epoch_checkpoint import SignedAuthorityEpochSource
+from src.postgres_authority_checkpoint_store import PostgresAuthorityCheckpointStore
+
+checkpoint_store = PostgresAuthorityCheckpointStore(
+    provider_id="payments-postgres",
+    dsn=controller_database_dsn,
+    schema="agent_control",
+)
 
 epoch_source = SignedAuthorityEpochSource(
     provider_id="payments-postgres",
-    checkpoint_loader=load_checkpoint_and_anchor_atomically,
+    checkpoint_loader=checkpoint_store.load,
     keyring=checkpoint_verification_keys,
 )
 coordinator = AuthoritativeReconciliationCoordinator(
@@ -263,6 +270,23 @@ HMAC authenticity is not rollback protection by itself. The control-plane store 
 head digest atomically with the document and protect that digest against rollback. The in-process
 generation watermark only detects regression during one process lifetime. The source does not
 allocate epochs, promote PostgreSQL, fence a former primary or implement distributed consensus.
+
+`PostgresAuthorityCheckpointStore` supplies the missing atomic storage contract for deployments
+that use a dedicated PostgreSQL control plane. Operators create the schema, call `initialize()`
+under a migration role, and grant runtime readers only `SELECT`. A controller advances canonical
+signed checkpoints with `compare_and_swap(checkpoint_json, expected_sha256=previous_head)` under a
+serializable transaction, provider-scoped advisory lock and row lock. The store rejects stale heads,
+generation reuse, epoch regression, non-canonical documents and corrupted rows; an exact retry is
+idempotent. `load()` reads
+the document and digest from one repeatable-read snapshot, so it can be passed directly to
+`SignedAuthorityEpochSource`.
+
+The store deliberately does not hold signing keys or validate HMAC authenticity; the signed source
+retains that responsibility, while PostgreSQL roles authorize mutation. Its live CI contract uses a
+real PostgreSQL 17 service to prove initialization, CAS advancement, stale-writer rejection,
+idempotence, corruption detection and end-to-end epoch-source loading. This is a strongly consistent
+anchor, not an independent rollback oracle: restoring the control-plane database behind all readers
+can still restore an old head. Protected backups or an external monotonic anchor remain required.
 
 This adapter does not turn PostgreSQL streaming replication into consensus. Correctness still
 depends on the writer serialization rule, a rollback-protected controller epoch, a trustworthy
