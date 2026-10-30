@@ -1,0 +1,53 @@
+services:
+  primary:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: test-only-password
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=4
+      - -c
+      - max_replication_slots=4
+      - -c
+      - synchronous_commit=remote_apply
+      - -c
+      - hba_file=/etc/postgresql/drill-pg_hba.conf
+    ports:
+      - "55432:5432"
+    volumes:
+      - primary-data:/var/lib/postgresql/data
+      - ./primary-init.sql:/docker-entrypoint-initdb.d/primary-init.sql:ro
+      - ./primary-pg_hba.conf:/etc/postgresql/drill-pg_hba.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  standby:
+    image: postgres:17-alpine
+    user: postgres
+    depends_on:
+      primary:
+        condition: service_healthy
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      PGPASSWORD: replication-test-password
+    entrypoint: ["/bin/sh", "/opt/drill/start-standby.sh"]
+    ports:
+      - "55433:5432"
+    volumes:
+      - standby-data:/var/lib/postgresql/data
+      - ./start-standby.sh:/opt/drill/start-standby.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  primary-data:
+  standby-data:
