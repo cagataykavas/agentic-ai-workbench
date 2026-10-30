@@ -42,6 +42,25 @@ _PREPARED_FIELDS = frozenset(
         "system_identifier_sha256",
     }
 )
+_VERIFIED_FIELDS = frozenset(
+    {
+        "checkpoint_sha256",
+        "evidence_sha256",
+        "generation",
+        "minimum_authority_epoch",
+        "new_timeline",
+        "old_primary_isolated",
+        "phase",
+        "pre_failover_checkpoint_sha256",
+        "pre_failover_timeline",
+        "prepared_evidence_sha256",
+        "provider_id",
+        "recovered_checkpoint",
+        "schema_version",
+        "system_identifier_sha256",
+        "verified_at_ms",
+    }
+)
 
 
 class FailoverDrillError(RuntimeError):
@@ -74,26 +93,41 @@ def seal_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {**payload, "evidence_sha256": digest}
 
 
-def load_prepared_evidence(path: Path) -> dict[str, Any]:
+def _load_sealed_evidence(
+    path: Path,
+    *,
+    fields: frozenset[str],
+    error_prefix: str,
+) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
     except OSError as exc:
-        raise FailoverDrillError("prepared_evidence_unavailable") from exc
+        raise FailoverDrillError(f"{error_prefix}_evidence_unavailable") from exc
     if not raw or len(raw) > _MAX_EVIDENCE_BYTES:
-        raise FailoverDrillError("prepared_evidence_size_invalid")
+        raise FailoverDrillError(f"{error_prefix}_evidence_size_invalid")
     try:
         document = json.loads(raw, object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise FailoverDrillError("prepared_evidence_json_invalid") from exc
-    if not isinstance(document, dict) or set(document) != _PREPARED_FIELDS:
-        raise FailoverDrillError("prepared_evidence_schema_invalid")
+        raise FailoverDrillError(f"{error_prefix}_evidence_json_invalid") from exc
+    if not isinstance(document, dict) or set(document) != fields:
+        raise FailoverDrillError(f"{error_prefix}_evidence_schema_invalid")
     claimed = document.pop("evidence_sha256")
     if (
         not isinstance(claimed, str)
         or _SHA256_PATTERN.fullmatch(claimed) is None
         or not hmac.compare_digest(hashlib.sha256(_canonical(document)).hexdigest(), claimed)
     ):
-        raise FailoverDrillError("prepared_evidence_digest_invalid")
+        raise FailoverDrillError(f"{error_prefix}_evidence_digest_invalid")
+    document["evidence_sha256"] = claimed
+    return document
+
+
+def load_prepared_evidence(path: Path) -> dict[str, Any]:
+    document = _load_sealed_evidence(
+        path,
+        fields=_PREPARED_FIELDS,
+        error_prefix="prepared",
+    )
     if (
         document["schema_version"] != 1
         or document["phase"] != "prepared"
@@ -114,8 +148,87 @@ def load_prepared_evidence(path: Path) -> dict[str, Any]:
         or _SHA256_PATTERN.fullmatch(document["system_identifier_sha256"]) is None
     ):
         raise FailoverDrillError("prepared_evidence_fields_invalid")
-    document["evidence_sha256"] = claimed
     return document
+
+
+def load_verified_evidence(path: Path) -> dict[str, Any]:
+    document = _load_sealed_evidence(
+        path,
+        fields=_VERIFIED_FIELDS,
+        error_prefix="verified",
+    )
+    if (
+        document["schema_version"] != 1
+        or document["phase"] != "verified"
+        or document["generation"] != 2
+        or document["minimum_authority_epoch"] != 2
+        or document["old_primary_isolated"] is not True
+        or document["recovered_checkpoint"] is not True
+        or type(document["new_timeline"]) is not int
+        or document["new_timeline"] < 2
+        or type(document["pre_failover_timeline"]) is not int
+        or document["pre_failover_timeline"] < 1
+        or type(document["verified_at_ms"]) is not int
+        or not 0 < document["verified_at_ms"] <= 9_223_372_036_854_775_807
+        or not isinstance(document["provider_id"], str)
+        or _PROVIDER_PATTERN.fullmatch(document["provider_id"]) is None
+        or any(
+            not isinstance(document[field], str)
+            or _SHA256_PATTERN.fullmatch(document[field]) is None
+            for field in (
+                "checkpoint_sha256",
+                "pre_failover_checkpoint_sha256",
+                "prepared_evidence_sha256",
+                "system_identifier_sha256",
+            )
+        )
+    ):
+        raise FailoverDrillError("verified_evidence_fields_invalid")
+    return document
+
+
+def audit_evidence_chain(prepared_path: Path, verified_path: Path) -> dict[str, Any]:
+    prepared = load_prepared_evidence(prepared_path)
+    verified = load_verified_evidence(verified_path)
+    if (
+        not hmac.compare_digest(verified["provider_id"], prepared["provider_id"])
+        or not hmac.compare_digest(
+            verified["system_identifier_sha256"],
+            prepared["system_identifier_sha256"],
+        )
+        or not hmac.compare_digest(
+            verified["pre_failover_checkpoint_sha256"],
+            prepared["checkpoint_sha256"],
+        )
+        or not hmac.compare_digest(
+            verified["prepared_evidence_sha256"],
+            prepared["evidence_sha256"],
+        )
+        or verified["pre_failover_timeline"] != prepared["primary_timeline"]
+    ):
+        raise FailoverDrillError("evidence_chain_binding_invalid")
+    if (
+        verified["new_timeline"] <= prepared["primary_timeline"]
+        or verified["verified_at_ms"] < prepared["prepared_at_ms"]
+        or hmac.compare_digest(
+            verified["checkpoint_sha256"],
+            prepared["checkpoint_sha256"],
+        )
+    ):
+        raise FailoverDrillError("evidence_chain_transition_invalid")
+    return {
+        "audit": "passed",
+        "authority_epoch_transition": [
+            prepared["minimum_authority_epoch"],
+            verified["minimum_authority_epoch"],
+        ],
+        "generation_transition": [prepared["generation"], verified["generation"]],
+        "prepared_evidence_sha256": prepared["evidence_sha256"],
+        "provider_id": prepared["provider_id"],
+        "schema_version": 1,
+        "timeline_transition": [prepared["primary_timeline"], verified["new_timeline"]],
+        "verified_evidence_sha256": verified["evidence_sha256"],
+    }
 
 
 def _write_evidence(path: Path, document: Mapping[str, Any]) -> None:
@@ -360,13 +473,24 @@ def _parser() -> argparse.ArgumentParser:
     verified.add_argument("--promoted-dsn", required=True)
     verified.add_argument("--prepared-evidence", required=True, type=Path)
     verified.add_argument("--evidence", required=True, type=Path)
+    audit = subparsers.add_parser(
+        "audit",
+        help="validate an archived prepared/verified evidence chain without database access",
+    )
+    audit.add_argument("--prepared-evidence", required=True, type=Path)
+    audit.add_argument("--verified-evidence", required=True, type=Path)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        evidence = prepare(args) if args.phase == "prepare" else verify(args)
+        if args.phase == "prepare":
+            evidence = prepare(args)
+        elif args.phase == "verify":
+            evidence = verify(args)
+        else:
+            evidence = audit_evidence_chain(args.prepared_evidence, args.verified_evidence)
     except FailoverDrillError as exc:
         print(str(exc), file=sys.stderr)
         return 1

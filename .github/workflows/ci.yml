@@ -78,6 +78,11 @@ jobs:
             --promoted-dsn "$PROMOTED_DSN" \
             --prepared-evidence .artifacts/postgres-failover-prepared.json \
             --evidence .artifacts/postgres-failover-verified.json
+      - name: Audit archived evidence chain
+        run: |
+          python tools/postgres_authority_failover_drill.py audit \
+            --prepared-evidence .artifacts/postgres-failover-prepared.json \
+            --verified-evidence .artifacts/postgres-failover-verified.json
       - uses: actions/upload-artifact@v4
         with:
           name: postgres-authority-failover-evidence

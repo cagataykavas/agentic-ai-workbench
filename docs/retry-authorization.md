@@ -80,7 +80,22 @@ connection fails the drill before the promoted writer is allowed to advance.
 The two phases exchange sealed, bounded JSON evidence containing only checkpoint digests, a hashed
 system identifier, timelines, epochs and boolean assertions. DSNs, passwords, signing material and
 raw checkpoint documents are excluded. The final artifact binds the preparation artifact digest so
-the promotion result cannot be paired with a different pre-failover observation.
+the promotion result cannot be paired with a different pre-failover observation. CI then runs the
+database-free `audit` command over both archived documents. The auditor rejects duplicate or unknown
+fields, invalid seals, unsafe types, a different provider or cluster, a substituted preparation
+document, a non-advancing timeline or checkpoint, and timestamps that reverse the phase order:
+
+```bash
+python tools/postgres_authority_failover_drill.py audit \
+  --prepared-evidence postgres-failover-prepared.json \
+  --verified-evidence postgres-failover-verified.json
+```
+
+The successful output is a key-free digest and transition summary suitable for an artifact intake
+gate. The evidence SHA-256 values provide integrity and pairing checks, not trusted provenance: an
+attacker able to replace both artifacts can recompute their unkeyed seals. Consumers that require
+origin authentication must pin the expected digests in a separately protected system or verify a
+CI attestation/signature before running this structural audit.
 
 This is an integration drill, not a consensus or disaster-recovery claim. The old primary is
 process-stopped rather than network-partitioned, promotion is operator-driven, and the topology has
