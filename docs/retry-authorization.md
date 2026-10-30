@@ -67,3 +67,23 @@ the decision, not that the datastore metadata was truthful. Database rollback ca
 Production systems still need protected keys, durable backups, audit retention, downstream fencing
 enforcement and monitoring for long-lived or budget-exhausted unknown claims. The retry limit is
 per idempotency claim, not a global rate limiter or downstream circuit breaker.
+
+## PostgreSQL failover drill
+
+CI also exercises `PostgresAuthorityCheckpointStore` against a disposable PostgreSQL 17
+primary/standby pair. The drill waits for a synchronous streaming replica, writes generation 1,
+and proves the exact checkpoint is readable on the hot standby. It then stops the old primary,
+promotes the standby onto a higher timeline, verifies the cluster identity and recovered head, and
+advances generation 2 with the pre-failover digest as the CAS condition. A successful old-primary
+connection fails the drill before the promoted writer is allowed to advance.
+
+The two phases exchange sealed, bounded JSON evidence containing only checkpoint digests, a hashed
+system identifier, timelines, epochs and boolean assertions. DSNs, passwords, signing material and
+raw checkpoint documents are excluded. The final artifact binds the preparation artifact digest so
+the promotion result cannot be paired with a different pre-failover observation.
+
+This is an integration drill, not a consensus or disaster-recovery claim. The old primary is
+process-stopped rather than network-partitioned, promotion is operator-driven, and the topology has
+one standby. Production deployments still require an external election authority, split-brain
+prevention, credential rotation, durable backup/restore testing and an independently
+rollback-protected checkpoint anchor.

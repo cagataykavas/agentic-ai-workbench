@@ -236,6 +236,8 @@ src/authority_epoch_checkpoint.py  signed, externally anchored controller epoch 
 src/postgres_authority_checkpoint_store.py  serializable checkpoint CAS and atomic loader
 tools/mtls_reconciliation_sandbox.py disposable live-TLS fault-injection endpoint
 tools/replicated_status_model.py deterministic acknowledged-write failover model
+tools/postgres_authority_failover_drill.py PostgreSQL promotion and checkpoint-recovery drill
+deploy/postgres-failover/     disposable PostgreSQL 17 primary/standby topology
 docs/retry-authorization.md    signed no-commit decisions and retry threat model
 docs/ledger-observability.md    key-free gauges, durable counters and alerting boundary
 docs/authoritative-reconciliation.md  provider contract, deadlines and trust boundary
@@ -262,6 +264,8 @@ GitHub Actions validates the full public engineering surface:
 - replica-gated reconciliation commits, stale-promotion fault injection and proof-gated negative
   decisions over live mTLS;
 - PostgreSQL primary-role, WAL-watermark and snapshot-consistent negative-proof derivation;
+- synchronous authority-checkpoint replication, old-primary isolation, standby promotion and
+  post-promotion CAS advancement on a disposable PostgreSQL 17 topology;
 - live CA/server/client certificate generation, mutual-TLS handshake and timeout-after-observation;
 - execution budget handling;
 - trace evaluation;
