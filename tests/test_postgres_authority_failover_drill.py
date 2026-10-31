@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +14,7 @@ from tools.postgres_authority_failover_drill import (
     load_verified_evidence,
     probe_old_primary_isolated,
     seal_evidence,
+    verify_attested_evidence_chain,
 )
 
 
@@ -111,6 +114,114 @@ def test_archived_evidence_chain_audit_returns_digest_only_summary(tmp_path: Pat
         "timeline_transition": [1, 2],
         "verified_evidence_sha256": verified["evidence_sha256"],
     }
+
+
+def test_attested_evidence_chain_pins_provenance_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = seal_evidence(prepared_payload())
+    verified = seal_evidence(verified_payload(prepared))
+    prepared_path = tmp_path / "prepared.json"
+    verified_path = tmp_path / "verified.json"
+    write(prepared_path, prepared)
+    write(verified_path, verified)
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = verify_attested_evidence_chain(
+        prepared_path,
+        verified_path,
+        repository="example/agentic-ai-workbench",
+        signer_workflow=".github/workflows/ci.yml",
+        source_ref="refs/heads/main",
+    )
+
+    assert result["provenance"] == "verified"
+    assert result["signer_workflow"] == (
+        "example/agentic-ai-workbench/.github/workflows/ci.yml"
+    )
+    assert [call[0] for call in calls] == [
+        [
+            "gh",
+            "attestation",
+            "verify",
+            str(path),
+            "--repo",
+            "example/agentic-ai-workbench",
+            "--signer-workflow",
+            "example/agentic-ai-workbench/.github/workflows/ci.yml",
+            "--source-ref",
+            "refs/heads/main",
+            "--deny-self-hosted-runners",
+        ]
+        for path in (prepared_path, verified_path)
+    ]
+    assert all(
+        kwargs
+        == {
+            "capture_output": True,
+            "check": False,
+            "text": True,
+            "timeout": 30,
+        }
+        for _, kwargs in calls
+    )
+
+
+def test_attested_evidence_chain_fails_closed_on_verifier_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = seal_evidence(prepared_payload())
+    verified = seal_evidence(verified_payload(prepared))
+    prepared_path = tmp_path / "prepared.json"
+    verified_path = tmp_path / "verified.json"
+    write(prepared_path, prepared)
+    write(verified_path, verified)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1),
+    )
+
+    with pytest.raises(FailoverDrillError, match="prepared_attestation_invalid"):
+        verify_attested_evidence_chain(
+            prepared_path,
+            verified_path,
+            repository="example/agentic-ai-workbench",
+            signer_workflow=".github/workflows/ci.yml",
+            source_ref="refs/heads/main",
+        )
+
+
+@pytest.mark.parametrize(
+    ("repository", "workflow", "source_ref"),
+    [
+        ("missing-owner", ".github/workflows/ci.yml", "refs/heads/main"),
+        ("example/repo", "../ci.yml", "refs/heads/main"),
+        ("example/repo", ".github/workflows/ci.yml", "main"),
+    ],
+)
+def test_attested_evidence_chain_rejects_ambiguous_policy(
+    tmp_path: Path,
+    repository: str,
+    workflow: str,
+    source_ref: str,
+) -> None:
+    with pytest.raises(FailoverDrillError, match="attestation_policy_invalid"):
+        verify_attested_evidence_chain(
+            tmp_path / "prepared.json",
+            tmp_path / "verified.json",
+            repository=repository,
+            signer_workflow=workflow,
+            source_ref=source_ref,
+        )
 
 
 def test_evidence_chain_rejects_valid_but_mismatched_preparation(tmp_path: Path) -> None:
