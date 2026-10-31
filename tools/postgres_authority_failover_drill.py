@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from collections.abc import Mapping
@@ -25,6 +26,11 @@ from src.postgres_authority_checkpoint_store import (
 _MAX_EVIDENCE_BYTES = 16_384
 _IDENTIFIER_PATTERN = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _PROVIDER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+_REPOSITORY_PATTERN = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})"
+)
+_SOURCE_REF_PATTERN = re.compile(r"refs/(?:heads|tags)/[A-Za-z0-9][A-Za-z0-9_./-]{0,254}")
+_WORKFLOW_PATH_PATTERN = re.compile(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _PREPARED_FIELDS = frozenset(
     {
@@ -228,6 +234,64 @@ def audit_evidence_chain(prepared_path: Path, verified_path: Path) -> dict[str, 
         "schema_version": 1,
         "timeline_transition": [prepared["primary_timeline"], verified["new_timeline"]],
         "verified_evidence_sha256": verified["evidence_sha256"],
+    }
+
+
+def verify_attested_evidence_chain(
+    prepared_path: Path,
+    verified_path: Path,
+    *,
+    repository: str,
+    signer_workflow: str,
+    source_ref: str,
+) -> dict[str, Any]:
+    """Verify GitHub provenance for both artifacts, then their causal relationship."""
+    if (
+        _REPOSITORY_PATTERN.fullmatch(repository) is None
+        or _WORKFLOW_PATH_PATTERN.fullmatch(signer_workflow) is None
+        or _SOURCE_REF_PATTERN.fullmatch(source_ref) is None
+        or ".." in signer_workflow
+        or ".." in source_ref
+    ):
+        raise FailoverDrillError("attestation_policy_invalid")
+
+    signer_identity = f"{repository}/{signer_workflow}"
+    for phase, path in (("prepared", prepared_path), ("verified", verified_path)):
+        command = [
+            "gh",
+            "attestation",
+            "verify",
+            str(path),
+            "--repo",
+            repository,
+            "--signer-workflow",
+            signer_identity,
+            "--source-ref",
+            source_ref,
+            "--deny-self-hosted-runners",
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise FailoverDrillError(f"{phase}_attestation_verification_timeout") from exc
+        except OSError as exc:
+            raise FailoverDrillError("attestation_verifier_unavailable") from exc
+        if completed.returncode != 0:
+            raise FailoverDrillError(f"{phase}_attestation_invalid")
+
+    audit = audit_evidence_chain(prepared_path, verified_path)
+    return {
+        **audit,
+        "provenance": "verified",
+        "repository": repository,
+        "signer_workflow": signer_identity,
+        "source_ref": source_ref,
     }
 
 
@@ -479,6 +543,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     audit.add_argument("--prepared-evidence", required=True, type=Path)
     audit.add_argument("--verified-evidence", required=True, type=Path)
+    attest = subparsers.add_parser(
+        "verify-attestation",
+        help="verify GitHub provenance and then audit the archived evidence chain",
+    )
+    attest.add_argument("--prepared-evidence", required=True, type=Path)
+    attest.add_argument("--verified-evidence", required=True, type=Path)
+    attest.add_argument("--repository", required=True)
+    attest.add_argument("--signer-workflow", default=".github/workflows/ci.yml")
+    attest.add_argument("--source-ref", default="refs/heads/main")
     return parser
 
 
@@ -489,8 +562,16 @@ def main(argv: list[str] | None = None) -> int:
             evidence = prepare(args)
         elif args.phase == "verify":
             evidence = verify(args)
-        else:
+        elif args.phase == "audit":
             evidence = audit_evidence_chain(args.prepared_evidence, args.verified_evidence)
+        else:
+            evidence = verify_attested_evidence_chain(
+                args.prepared_evidence,
+                args.verified_evidence,
+                repository=args.repository,
+                signer_workflow=args.signer_workflow,
+                source_ref=args.source_ref,
+            )
     except FailoverDrillError as exc:
         print(str(exc), file=sys.stderr)
         return 1

@@ -93,9 +93,27 @@ python tools/postgres_authority_failover_drill.py audit \
 
 The successful output is a key-free digest and transition summary suitable for an artifact intake
 gate. The evidence SHA-256 values provide integrity and pairing checks, not trusted provenance: an
-attacker able to replace both artifacts can recompute their unkeyed seals. Consumers that require
-origin authentication must pin the expected digests in a separately protected system or verify a
-CI attestation/signature before running this structural audit.
+attacker able to replace both artifacts can recompute their unkeyed seals. On trusted pushes, CI
+therefore issues keyless GitHub artifact attestations for both evidence files after the structural
+audit passes. The action is pinned to an immutable commit and receives only `contents: read`,
+`id-token: write` and `attestations: write`; no long-lived signing key is stored.
+
+After downloading both files, a consumer with GitHub CLI authentication can require the repository,
+signer workflow, source ref and a GitHub-hosted runner before repeating the causal audit:
+
+```bash
+python tools/postgres_authority_failover_drill.py verify-attestation \
+  --prepared-evidence postgres-failover-prepared.json \
+  --verified-evidence postgres-failover-verified.json \
+  --repository cagataykavas/agentic-ai-workbench \
+  --signer-workflow .github/workflows/ci.yml \
+  --source-ref refs/heads/main
+```
+
+Verification fails closed if `gh attestation verify` is unavailable, times out or rejects either
+file. Pinning `refs/heads/main` is important: repository members can generate attestations from
+other trusted-push branches, and provenance authenticates the workflow identity and inputs rather
+than proving the database observations were truthful.
 
 This is an integration drill, not a consensus or disaster-recovery claim. The old primary is
 process-stopped rather than network-partitioned, promotion is operator-driven, and the topology has
