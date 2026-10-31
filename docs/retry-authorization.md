@@ -115,8 +115,39 @@ file. Pinning `refs/heads/main` is important: repository members can generate at
 other trusted-push branches, and provenance authenticates the workflow identity and inputs rather
 than proving the database observations were truthful.
 
+For disaster-recovery intake without GitHub API access, download each evidence file's bundle while
+online and refresh the trusted root before crossing the air gap. Also record the repository's
+numeric ID from the GitHub API; unlike its name, that identifier survives a rename and cannot be
+reused by a replacement repository. The verifier requires the complete offline policy and checks
+the repository ID in every verified signing certificate:
+
+```bash
+gh attestation download postgres-failover-prepared.json \
+  --repo cagataykavas/agentic-ai-workbench
+gh attestation download postgres-failover-verified.json \
+  --repo cagataykavas/agentic-ai-workbench
+gh attestation trusted-root > trusted_root.jsonl
+
+python tools/postgres_authority_failover_drill.py verify-attestation \
+  --prepared-evidence postgres-failover-prepared.json \
+  --verified-evidence postgres-failover-verified.json \
+  --repository cagataykavas/agentic-ai-workbench \
+  --source-ref refs/heads/main \
+  --prepared-bundle sha256:PREPARED_DIGEST.jsonl \
+  --verified-bundle sha256:VERIFIED_DIGEST.jsonl \
+  --trusted-root trusted_root.jsonl \
+  --repository-id 1329851199
+```
+
+Transfer the trusted root over a separately controlled channel; a root supplied by the same party
+as the evidence is not a trust boundary. Refresh it whenever new signed material is imported.
+Offline verification cannot discover repository renames or trust-root revocation after the root was
+captured, so the archived repository ID and root acquisition record remain part of the intake
+procedure.
+
 This is an integration drill, not a consensus or disaster-recovery claim. The old primary is
 process-stopped rather than network-partitioned, promotion is operator-driven, and the topology has
 one standby. Production deployments still require an external election authority, split-brain
 prevention, credential rotation, durable backup/restore testing and an independently
 rollback-protected checkpoint anchor.
+

@@ -32,6 +32,7 @@ _REPOSITORY_PATTERN = re.compile(
 _SOURCE_REF_PATTERN = re.compile(r"refs/(?:heads|tags)/[A-Za-z0-9][A-Za-z0-9_./-]{0,254}")
 _WORKFLOW_PATH_PATTERN = re.compile(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_REPOSITORY_ID_PATTERN = re.compile(r"[1-9][0-9]{0,19}")
 _PREPARED_FIELDS = frozenset(
     {
         "checkpoint_sha256",
@@ -244,19 +245,43 @@ def verify_attested_evidence_chain(
     repository: str,
     signer_workflow: str,
     source_ref: str,
+    prepared_bundle: Path | None = None,
+    verified_bundle: Path | None = None,
+    trusted_root: Path | None = None,
+    repository_id: str | None = None,
 ) -> dict[str, Any]:
-    """Verify GitHub provenance for both artifacts, then their causal relationship."""
+    """Verify GitHub provenance for both artifacts, then their causal relationship.
+
+    Supplying all four offline-policy arguments disables API attestation lookup, uses the
+    archived bundles and trusted root, and pins the immutable repository identifier.
+    """
+    offline_policy = (
+        prepared_bundle,
+        verified_bundle,
+        trusted_root,
+        repository_id,
+    )
+    offline = all(value is not None for value in offline_policy)
     if (
         _REPOSITORY_PATTERN.fullmatch(repository) is None
         or _WORKFLOW_PATH_PATTERN.fullmatch(signer_workflow) is None
         or _SOURCE_REF_PATTERN.fullmatch(source_ref) is None
         or ".." in signer_workflow
         or ".." in source_ref
+        or any(value is not None for value in offline_policy) != offline
+        or (
+            repository_id is not None
+            and _REPOSITORY_ID_PATTERN.fullmatch(repository_id) is None
+        )
     ):
         raise FailoverDrillError("attestation_policy_invalid")
 
     signer_identity = f"{repository}/{signer_workflow}"
-    for phase, path in (("prepared", prepared_path), ("verified", verified_path)):
+    artifacts = (
+        ("prepared", prepared_path, prepared_bundle),
+        ("verified", verified_path, verified_bundle),
+    )
+    for phase, path, bundle in artifacts:
         command = [
             "gh",
             "attestation",
@@ -270,6 +295,17 @@ def verify_attested_evidence_chain(
             source_ref,
             "--deny-self-hosted-runners",
         ]
+        if offline:
+            command.extend(
+                [
+                    "--bundle",
+                    str(bundle),
+                    "--custom-trusted-root",
+                    str(trusted_root),
+                    "--format",
+                    "json",
+                ]
+            )
         try:
             completed = subprocess.run(
                 command,
@@ -284,6 +320,24 @@ def verify_attested_evidence_chain(
             raise FailoverDrillError("attestation_verifier_unavailable") from exc
         if completed.returncode != 0:
             raise FailoverDrillError(f"{phase}_attestation_invalid")
+        if offline:
+            try:
+                results = json.loads(completed.stdout)
+                repository_ids = [
+                    result["verificationResult"]["signature"]["certificate"][
+                        "sourceRepositoryIdentifier"
+                    ]
+                    for result in results
+                ]
+            except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise FailoverDrillError(f"{phase}_attestation_result_invalid") from exc
+            if not repository_ids or any(
+                isinstance(value, bool) or str(value) != repository_id
+                for value in repository_ids
+            ):
+                raise FailoverDrillError(
+                    f"{phase}_attestation_repository_id_invalid"
+                )
 
     audit = audit_evidence_chain(prepared_path, verified_path)
     return {
@@ -292,6 +346,7 @@ def verify_attested_evidence_chain(
         "repository": repository,
         "signer_workflow": signer_identity,
         "source_ref": source_ref,
+        "verification_mode": "offline" if offline else "online",
     }
 
 
@@ -552,6 +607,10 @@ def _parser() -> argparse.ArgumentParser:
     attest.add_argument("--repository", required=True)
     attest.add_argument("--signer-workflow", default=".github/workflows/ci.yml")
     attest.add_argument("--source-ref", default="refs/heads/main")
+    attest.add_argument("--prepared-bundle", type=Path)
+    attest.add_argument("--verified-bundle", type=Path)
+    attest.add_argument("--trusted-root", type=Path)
+    attest.add_argument("--repository-id")
     return parser
 
 
@@ -571,6 +630,10 @@ def main(argv: list[str] | None = None) -> int:
                 repository=args.repository,
                 signer_workflow=args.signer_workflow,
                 source_ref=args.source_ref,
+                prepared_bundle=args.prepared_bundle,
+                verified_bundle=args.verified_bundle,
+                trusted_root=args.trusted_root,
+                repository_id=args.repository_id,
             )
     except FailoverDrillError as exc:
         print(str(exc), file=sys.stderr)
@@ -581,3 +644,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
