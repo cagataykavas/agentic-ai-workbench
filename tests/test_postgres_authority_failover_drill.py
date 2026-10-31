@@ -200,6 +200,122 @@ def test_attested_evidence_chain_fails_closed_on_verifier_error(
         )
 
 
+def test_offline_attested_evidence_chain_pins_bundles_root_and_repository_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = seal_evidence(prepared_payload())
+    verified = seal_evidence(verified_payload(prepared))
+    prepared_path = tmp_path / "prepared.json"
+    verified_path = tmp_path / "verified.json"
+    prepared_bundle = tmp_path / "prepared.jsonl"
+    verified_bundle = tmp_path / "verified.jsonl"
+    trusted_root = tmp_path / "trusted_root.jsonl"
+    write(prepared_path, prepared)
+    write(verified_path, verified)
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        result = [
+            {
+                "verificationResult": {
+                    "signature": {
+                        "certificate": {"sourceRepositoryIdentifier": "1329851199"}
+                    }
+                }
+            }
+        ]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(result))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = verify_attested_evidence_chain(
+        prepared_path,
+        verified_path,
+        repository="example/agentic-ai-workbench",
+        signer_workflow=".github/workflows/ci.yml",
+        source_ref="refs/heads/main",
+        prepared_bundle=prepared_bundle,
+        verified_bundle=verified_bundle,
+        trusted_root=trusted_root,
+        repository_id="1329851199",
+    )
+
+    assert result["verification_mode"] == "offline"
+    for command, bundle in zip(calls, (prepared_bundle, verified_bundle), strict=True):
+        assert command[-6:] == [
+            "--bundle",
+            str(bundle),
+            "--custom-trusted-root",
+            str(trusted_root),
+            "--format",
+            "json",
+        ]
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "not-json",
+        "[]",
+        json.dumps([{"verificationResult": {}}]),
+        json.dumps(
+            [
+                {
+                    "verificationResult": {
+                        "signature": {
+                            "certificate": {"sourceRepositoryIdentifier": "999"}
+                        }
+                    }
+                }
+            ]
+        ),
+    ],
+)
+def test_offline_attestation_rejects_untrusted_repository_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+) -> None:
+    prepared = seal_evidence(prepared_payload())
+    verified = seal_evidence(verified_payload(prepared))
+    prepared_path = tmp_path / "prepared.json"
+    verified_path = tmp_path / "verified.json"
+    write(prepared_path, prepared)
+    write(verified_path, verified)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=stdout),
+    )
+
+    with pytest.raises(FailoverDrillError, match="attestation_(result|repository_id)_invalid"):
+        verify_attested_evidence_chain(
+            prepared_path,
+            verified_path,
+            repository="example/agentic-ai-workbench",
+            signer_workflow=".github/workflows/ci.yml",
+            source_ref="refs/heads/main",
+            prepared_bundle=tmp_path / "prepared.jsonl",
+            verified_bundle=tmp_path / "verified.jsonl",
+            trusted_root=tmp_path / "trusted_root.jsonl",
+            repository_id="1329851199",
+        )
+
+
+def test_offline_attestation_requires_complete_policy(tmp_path: Path) -> None:
+    with pytest.raises(FailoverDrillError, match="attestation_policy_invalid"):
+        verify_attested_evidence_chain(
+            tmp_path / "prepared.json",
+            tmp_path / "verified.json",
+            repository="example/agentic-ai-workbench",
+            signer_workflow=".github/workflows/ci.yml",
+            source_ref="refs/heads/main",
+            prepared_bundle=tmp_path / "prepared.jsonl",
+        )
+
+
 @pytest.mark.parametrize(
     ("repository", "workflow", "source_ref"),
     [
@@ -331,3 +447,4 @@ def test_reachable_old_primary_fails_drill_and_closes_probe() -> None:
     with pytest.raises(FailoverDrillError, match="still_reachable"):
         probe_old_primary_isolated("not-recorded", FakePsycopg(connection))
     assert connection.closed is True
+
