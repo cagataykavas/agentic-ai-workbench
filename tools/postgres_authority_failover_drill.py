@@ -26,12 +26,11 @@ from src.postgres_authority_checkpoint_store import (
 _MAX_EVIDENCE_BYTES = 16_384
 _IDENTIFIER_PATTERN = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _PROVIDER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
-_REPOSITORY_PATTERN = re.compile(
-    r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})"
-)
+_REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})")
 _SOURCE_REF_PATTERN = re.compile(r"refs/(?:heads|tags)/[A-Za-z0-9][A-Za-z0-9_./-]{0,254}")
 _WORKFLOW_PATH_PATTERN = re.compile(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_GIT_OBJECT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _REPOSITORY_ID_PATTERN = re.compile(r"[1-9][0-9]{0,19}")
 _PREPARED_FIELDS = frozenset(
     {
@@ -180,8 +179,7 @@ def load_verified_evidence(path: Path) -> dict[str, Any]:
         or not isinstance(document["provider_id"], str)
         or _PROVIDER_PATTERN.fullmatch(document["provider_id"]) is None
         or any(
-            not isinstance(document[field], str)
-            or _SHA256_PATTERN.fullmatch(document[field]) is None
+            not isinstance(document[field], str) or _SHA256_PATTERN.fullmatch(document[field]) is None
             for field in (
                 "checkpoint_sha256",
                 "pre_failover_checkpoint_sha256",
@@ -244,6 +242,7 @@ def verify_attested_evidence_chain(
     *,
     repository: str,
     signer_workflow: str,
+    signer_digest: str,
     source_ref: str,
     prepared_bundle: Path | None = None,
     verified_bundle: Path | None = None,
@@ -265,14 +264,12 @@ def verify_attested_evidence_chain(
     if (
         _REPOSITORY_PATTERN.fullmatch(repository) is None
         or _WORKFLOW_PATH_PATTERN.fullmatch(signer_workflow) is None
+        or _GIT_OBJECT_ID_PATTERN.fullmatch(signer_digest) is None
         or _SOURCE_REF_PATTERN.fullmatch(source_ref) is None
         or ".." in signer_workflow
         or ".." in source_ref
         or any(value is not None for value in offline_policy) != offline
-        or (
-            repository_id is not None
-            and _REPOSITORY_ID_PATTERN.fullmatch(repository_id) is None
-        )
+        or (repository_id is not None and _REPOSITORY_ID_PATTERN.fullmatch(repository_id) is None)
     ):
         raise FailoverDrillError("attestation_policy_invalid")
 
@@ -291,6 +288,8 @@ def verify_attested_evidence_chain(
             repository,
             "--signer-workflow",
             signer_identity,
+            "--signer-digest",
+            signer_digest,
             "--source-ref",
             source_ref,
             "--deny-self-hosted-runners",
@@ -324,26 +323,22 @@ def verify_attested_evidence_chain(
             try:
                 results = json.loads(completed.stdout)
                 repository_ids = [
-                    result["verificationResult"]["signature"]["certificate"][
-                        "sourceRepositoryIdentifier"
-                    ]
+                    result["verificationResult"]["signature"]["certificate"]["sourceRepositoryIdentifier"]
                     for result in results
                 ]
             except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as exc:
                 raise FailoverDrillError(f"{phase}_attestation_result_invalid") from exc
             if not repository_ids or any(
-                isinstance(value, bool) or str(value) != repository_id
-                for value in repository_ids
+                isinstance(value, bool) or str(value) != repository_id for value in repository_ids
             ):
-                raise FailoverDrillError(
-                    f"{phase}_attestation_repository_id_invalid"
-                )
+                raise FailoverDrillError(f"{phase}_attestation_repository_id_invalid")
 
     audit = audit_evidence_chain(prepared_path, verified_path)
     return {
         **audit,
         "provenance": "verified",
         "repository": repository,
+        "signer_digest": signer_digest,
         "signer_workflow": signer_identity,
         "source_ref": source_ref,
         "verification_mode": "offline" if offline else "online",
@@ -605,7 +600,11 @@ def _parser() -> argparse.ArgumentParser:
     attest.add_argument("--prepared-evidence", required=True, type=Path)
     attest.add_argument("--verified-evidence", required=True, type=Path)
     attest.add_argument("--repository", required=True)
-    attest.add_argument("--signer-workflow", default=".github/workflows/ci.yml")
+    attest.add_argument(
+        "--signer-workflow",
+        default=".github/workflows/attest-failover-evidence.yml",
+    )
+    attest.add_argument("--signer-digest", required=True)
     attest.add_argument("--source-ref", default="refs/heads/main")
     attest.add_argument("--prepared-bundle", type=Path)
     attest.add_argument("--verified-bundle", type=Path)
@@ -629,6 +628,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.verified_evidence,
                 repository=args.repository,
                 signer_workflow=args.signer_workflow,
+                signer_digest=args.signer_digest,
                 source_ref=args.source_ref,
                 prepared_bundle=args.prepared_bundle,
                 verified_bundle=args.verified_bundle,
@@ -644,4 +644,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

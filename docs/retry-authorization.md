@@ -93,10 +93,20 @@ python tools/postgres_authority_failover_drill.py audit \
 
 The successful output is a key-free digest and transition summary suitable for an artifact intake
 gate. The evidence SHA-256 values provide integrity and pairing checks, not trusted provenance: an
-attacker able to replace both artifacts can recompute their unkeyed seals. On trusted pushes, CI
-therefore issues keyless GitHub artifact attestations for both evidence files after the structural
-audit passes. The action is pinned to an immutable commit and receives only `contents: read`,
-`id-token: write` and `attestations: write`; no long-lived signing key is stored.
+attacker able to replace both artifacts can recompute their unkeyed seals. On default-branch
+pushes, CI therefore hands the unsigned evidence to the reusable
+`.github/workflows/attest-failover-evidence.yml` signer. That workflow downloads the exact named
+artifact, repeats the structural/causal audit inside its own job, and only then issues keyless GitHub
+artifact attestations. The signing job is bound to the `failover-evidence-signer` environment. Its
+actions are pinned to immutable commits and it receives only `contents: read`, `id-token: write` and
+`attestations: write`; the failover job no longer receives signing authority and no long-lived key is
+stored.
+
+Repository code cannot create an environment protection boundary by itself. Before enabling
+production intake, configure `failover-evidence-signer` with required reviewers, prevent
+self-review, restrict deployment branches to the protected default branch, and protect changes to
+the reusable workflow. Until those controls exist and one default-branch run succeeds, this is a
+tested workflow contract rather than a claim that the hosted environment is protected.
 
 After downloading both files, a consumer with GitHub CLI authentication can require the repository,
 signer workflow, source ref and a GitHub-hosted runner before repeating the causal audit:
@@ -106,14 +116,17 @@ python tools/postgres_authority_failover_drill.py verify-attestation \
   --prepared-evidence postgres-failover-prepared.json \
   --verified-evidence postgres-failover-verified.json \
   --repository cagataykavas/agentic-ai-workbench \
-  --signer-workflow .github/workflows/ci.yml \
+  --signer-workflow .github/workflows/attest-failover-evidence.yml \
+  --signer-digest SIGNER_WORKFLOW_COMMIT_SHA \
   --source-ref refs/heads/main
 ```
 
 Verification fails closed if `gh attestation verify` is unavailable, times out or rejects either
-file. Pinning `refs/heads/main` is important: repository members can generate attestations from
-other trusted-push branches, and provenance authenticates the workflow identity and inputs rather
-than proving the database observations were truthful.
+file. The signer digest is the immutable Git object ID recorded for the reusable workflow revision;
+intake policy must update it through review whenever that workflow intentionally changes. Pinning
+both the signer digest and `refs/heads/main` prevents an older or substituted workflow revision from
+satisfying the gate. Provenance still authenticates workflow identity and inputs rather than proving
+that the database observations were truthful.
 
 For disaster-recovery intake without GitHub API access, download each evidence file's bundle while
 online and refresh the trusted root before crossing the air gap. Also record the repository's
@@ -132,6 +145,8 @@ python tools/postgres_authority_failover_drill.py verify-attestation \
   --prepared-evidence postgres-failover-prepared.json \
   --verified-evidence postgres-failover-verified.json \
   --repository cagataykavas/agentic-ai-workbench \
+  --signer-workflow .github/workflows/attest-failover-evidence.yml \
+  --signer-digest SIGNER_WORKFLOW_COMMIT_SHA \
   --source-ref refs/heads/main \
   --prepared-bundle sha256:PREPARED_DIGEST.jsonl \
   --verified-bundle sha256:VERIFIED_DIGEST.jsonl \
