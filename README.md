@@ -64,7 +64,7 @@ This keeps a human-in-the-loop workflow concrete: approval is represented as exe
 
 ### Idempotent retries
 
-Successful idempotent calls are stored using an explicit or deterministic SHA-256 idempotency key. The dependency executor additionally binds each key to the canonical tool-and-arguments digest, so a changed request cannot receive a stale replay. Equivalent retries return `replayed` with the previous output instead of repeating the side effect. An optional standard-library SQLite ledger preserves these decisions across process restarts while keeping the in-memory default convenient for tests.
+Successful idempotent calls are stored using an explicit or deterministic SHA-256 idempotency key. Both the basic governed runtime and the dependency executor bind every key to the canonical tool-and-arguments digest, so an explicit key reused with a changed request fails before tool dispatch instead of receiving a stale replay. Equivalent JSON objects with reordered keys still replay the previous output without repeating the side effect. An optional standard-library SQLite ledger preserves these request bindings across process restarts while keeping the in-memory default convenient for tests.
 
 The SQLite adapter also claims new work before tool dispatch. One worker receives a monotonically
 increasing fencing token; competitors fail closed without invoking the handler. Handlers can read
@@ -297,3 +297,4 @@ No external model API is required for CI.
 ## Interview topics
 
 **agentic AI · tool calling · planning vs execution · policy gates · human approval · idempotency · bounded agents · structured traces · retries · side effects · agent evaluation · human-in-the-loop · deterministic baselines · CI.**
+

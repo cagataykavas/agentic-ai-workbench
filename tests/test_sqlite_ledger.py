@@ -14,7 +14,14 @@ from src.dag_execution import (
     DependencyExecutor,
     get_current_fencing_token,
 )
-from src.governed_runtime import IdempotencyPayloadMismatchError, ToolRegistry, ToolSpec
+from src.governed_runtime import (
+    ActionStatus,
+    GovernedAgentRuntime,
+    IdempotencyPayloadMismatchError,
+    PlannedAction,
+    ToolRegistry,
+    ToolSpec,
+)
 from src.sqlite_ledger import (
     ClaimDisposition,
     SQLiteExecutionLedger,
@@ -110,6 +117,35 @@ def test_payload_mismatch_fails_closed_after_restart(tmp_path) -> None:
     assert changed.results[0].status is DagActionStatus.FAILED
     assert changed.results[0].error_code == "idempotency_key_payload_mismatch"
     assert calls == 1
+
+
+def test_basic_runtime_rejects_changed_request_after_ledger_restart(tmp_path) -> None:
+    database = tmp_path / "ledger.db"
+    calls: list[int] = []
+
+    def handler(arguments: dict) -> dict:
+        calls.append(arguments["value"])
+        return {"saved": arguments["value"]}
+
+    first = GovernedAgentRuntime(
+        registry_with(handler),
+        ledger=SQLiteExecutionLedger(database),
+    ).execute(
+        "original",
+        [PlannedAction("first", "write", {"value": 1}, idempotency_key="request-1")],
+    )
+    changed = GovernedAgentRuntime(
+        registry_with(handler),
+        ledger=SQLiteExecutionLedger(database),
+    ).execute(
+        "changed",
+        [PlannedAction("second", "write", {"value": 2}, idempotency_key="request-1")],
+    )
+
+    assert first.results[0].status is ActionStatus.SUCCEEDED
+    assert changed.results[0].status is ActionStatus.FAILED
+    assert changed.results[0].error == "idempotency_key_payload_mismatch"
+    assert calls == [1]
 
 
 def test_first_terminal_result_wins_under_concurrent_commits(tmp_path) -> None:
