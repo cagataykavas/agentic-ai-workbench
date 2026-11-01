@@ -17,6 +17,8 @@ from tools.postgres_authority_failover_drill import (
     verify_attested_evidence_chain,
 )
 
+SIGNER_DIGEST = "d" * 40
+
 
 def prepared_payload() -> dict[str, object]:
     return {
@@ -138,14 +140,16 @@ def test_attested_evidence_chain_pins_provenance_policy(
         prepared_path,
         verified_path,
         repository="example/agentic-ai-workbench",
-        signer_workflow=".github/workflows/ci.yml",
+        signer_workflow=".github/workflows/attest-failover-evidence.yml",
+        signer_digest=SIGNER_DIGEST,
         source_ref="refs/heads/main",
     )
 
     assert result["provenance"] == "verified"
     assert result["signer_workflow"] == (
-        "example/agentic-ai-workbench/.github/workflows/ci.yml"
+        "example/agentic-ai-workbench/.github/workflows/attest-failover-evidence.yml"
     )
+    assert result["signer_digest"] == SIGNER_DIGEST
     assert [call[0] for call in calls] == [
         [
             "gh",
@@ -155,7 +159,9 @@ def test_attested_evidence_chain_pins_provenance_policy(
             "--repo",
             "example/agentic-ai-workbench",
             "--signer-workflow",
-            "example/agentic-ai-workbench/.github/workflows/ci.yml",
+            "example/agentic-ai-workbench/.github/workflows/attest-failover-evidence.yml",
+            "--signer-digest",
+            SIGNER_DIGEST,
             "--source-ref",
             "refs/heads/main",
             "--deny-self-hosted-runners",
@@ -195,7 +201,8 @@ def test_attested_evidence_chain_fails_closed_on_verifier_error(
             prepared_path,
             verified_path,
             repository="example/agentic-ai-workbench",
-            signer_workflow=".github/workflows/ci.yml",
+            signer_workflow=".github/workflows/attest-failover-evidence.yml",
+            signer_digest=SIGNER_DIGEST,
             source_ref="refs/heads/main",
         )
 
@@ -220,9 +227,7 @@ def test_offline_attested_evidence_chain_pins_bundles_root_and_repository_id(
         result = [
             {
                 "verificationResult": {
-                    "signature": {
-                        "certificate": {"sourceRepositoryIdentifier": "1329851199"}
-                    }
+                    "signature": {"certificate": {"sourceRepositoryIdentifier": "1329851199"}}
                 }
             }
         ]
@@ -234,7 +239,8 @@ def test_offline_attested_evidence_chain_pins_bundles_root_and_repository_id(
         prepared_path,
         verified_path,
         repository="example/agentic-ai-workbench",
-        signer_workflow=".github/workflows/ci.yml",
+        signer_workflow=".github/workflows/attest-failover-evidence.yml",
+        signer_digest=SIGNER_DIGEST,
         source_ref="refs/heads/main",
         prepared_bundle=prepared_bundle,
         verified_bundle=verified_bundle,
@@ -261,15 +267,7 @@ def test_offline_attested_evidence_chain_pins_bundles_root_and_repository_id(
         "[]",
         json.dumps([{"verificationResult": {}}]),
         json.dumps(
-            [
-                {
-                    "verificationResult": {
-                        "signature": {
-                            "certificate": {"sourceRepositoryIdentifier": "999"}
-                        }
-                    }
-                }
-            ]
+            [{"verificationResult": {"signature": {"certificate": {"sourceRepositoryIdentifier": "999"}}}}]
         ),
     ],
 )
@@ -295,7 +293,8 @@ def test_offline_attestation_rejects_untrusted_repository_identity(
             prepared_path,
             verified_path,
             repository="example/agentic-ai-workbench",
-            signer_workflow=".github/workflows/ci.yml",
+            signer_workflow=".github/workflows/attest-failover-evidence.yml",
+            signer_digest=SIGNER_DIGEST,
             source_ref="refs/heads/main",
             prepared_bundle=tmp_path / "prepared.jsonl",
             verified_bundle=tmp_path / "verified.jsonl",
@@ -310,24 +309,28 @@ def test_offline_attestation_requires_complete_policy(tmp_path: Path) -> None:
             tmp_path / "prepared.json",
             tmp_path / "verified.json",
             repository="example/agentic-ai-workbench",
-            signer_workflow=".github/workflows/ci.yml",
+            signer_workflow=".github/workflows/attest-failover-evidence.yml",
+            signer_digest=SIGNER_DIGEST,
             source_ref="refs/heads/main",
             prepared_bundle=tmp_path / "prepared.jsonl",
         )
 
 
 @pytest.mark.parametrize(
-    ("repository", "workflow", "source_ref"),
+    ("repository", "workflow", "signer_digest", "source_ref"),
     [
-        ("missing-owner", ".github/workflows/ci.yml", "refs/heads/main"),
-        ("example/repo", "../ci.yml", "refs/heads/main"),
-        ("example/repo", ".github/workflows/ci.yml", "main"),
+        ("missing-owner", ".github/workflows/ci.yml", SIGNER_DIGEST, "refs/heads/main"),
+        ("example/repo", "../ci.yml", SIGNER_DIGEST, "refs/heads/main"),
+        ("example/repo", ".github/workflows/ci.yml", "main", "refs/heads/main"),
+        ("example/repo", ".github/workflows/ci.yml", "f" * 39, "refs/heads/main"),
+        ("example/repo", ".github/workflows/ci.yml", SIGNER_DIGEST, "main"),
     ],
 )
 def test_attested_evidence_chain_rejects_ambiguous_policy(
     tmp_path: Path,
     repository: str,
     workflow: str,
+    signer_digest: str,
     source_ref: str,
 ) -> None:
     with pytest.raises(FailoverDrillError, match="attestation_policy_invalid"):
@@ -336,6 +339,7 @@ def test_attested_evidence_chain_rejects_ambiguous_policy(
             tmp_path / "verified.json",
             repository=repository,
             signer_workflow=workflow,
+            signer_digest=signer_digest,
             source_ref=source_ref,
         )
 
@@ -447,4 +451,3 @@ def test_reachable_old_primary_fails_drill_and_closes_probe() -> None:
     with pytest.raises(FailoverDrillError, match="still_reachable"):
         probe_old_primary_isolated("not-recorded", FakePsycopg(connection))
     assert connection.closed is True
-
