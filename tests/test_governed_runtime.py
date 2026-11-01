@@ -1,5 +1,6 @@
 from src.governed_runtime import (
     ActionStatus,
+    ExecutionLedger,
     GovernedAgentRuntime,
     PlannedAction,
     PolicyConfig,
@@ -72,6 +73,96 @@ def test_idempotency_ledger_replays_duplicate_success_without_second_side_effect
     assert first.results[0].status is ActionStatus.SUCCEEDED
     assert second.results[0].status is ActionStatus.REPLAYED
     assert calls["count"] == 1
+
+
+def test_explicit_idempotency_key_rejects_changed_request_before_dispatch():
+    calls: list[int] = []
+
+    def handler(args: dict) -> dict:
+        calls.append(args["value"])
+        return {"saved": args["value"]}
+
+    registry = ToolRegistry()
+    registry.register(ToolSpec("save", "save record", handler))
+    runtime = GovernedAgentRuntime(registry)
+
+    original = runtime.execute(
+        "save original",
+        [PlannedAction("first", "save", {"value": 7}, idempotency_key="request-123")],
+    )
+    changed = runtime.execute(
+        "save changed",
+        [PlannedAction("second", "save", {"value": 8}, idempotency_key="request-123")],
+    )
+
+    assert original.results[0].status is ActionStatus.SUCCEEDED
+    assert changed.results[0].status is ActionStatus.FAILED
+    assert changed.results[0].error == "idempotency_key_payload_mismatch"
+    assert changed.results[0].output is None
+    assert calls == [7]
+
+
+def test_canonical_request_digest_replays_equivalent_argument_order():
+    calls = 0
+
+    def handler(args: dict) -> dict:
+        nonlocal calls
+        calls += 1
+        return {"total": args["left"] + args["right"]}
+
+    registry = ToolRegistry()
+    registry.register(ToolSpec("add", "add values", handler))
+    runtime = GovernedAgentRuntime(registry)
+
+    first = runtime.execute(
+        "add",
+        [
+            PlannedAction(
+                "first",
+                "add",
+                {"left": 2, "right": 3},
+                idempotency_key="addition-1",
+            )
+        ],
+    )
+    reordered = runtime.execute(
+        "add retry",
+        [
+            PlannedAction(
+                "second",
+                "add",
+                {"right": 3, "left": 2},
+                idempotency_key="addition-1",
+            )
+        ],
+    )
+
+    assert first.results[0].status is ActionStatus.SUCCEEDED
+    assert reordered.results[0].status is ActionStatus.REPLAYED
+    assert reordered.results[0].output == {"total": 5}
+    assert calls == 1
+
+
+def test_legacy_key_only_entry_fails_closed_without_dispatch():
+    ledger = ExecutionLedger()
+    ledger.record("request-123", {"saved": "legacy"})
+    calls = 0
+
+    def handler(args: dict) -> dict:
+        nonlocal calls
+        calls += 1
+        return {"saved": args["value"]}
+
+    registry = ToolRegistry()
+    registry.register(ToolSpec("save", "save record", handler))
+    result = GovernedAgentRuntime(registry, ledger=ledger).execute(
+        "retry legacy request",
+        [PlannedAction("retry", "save", {"value": 7}, idempotency_key="request-123")],
+    )
+
+    assert result.results[0].status is ActionStatus.FAILED
+    assert result.results[0].error == "idempotency_key_payload_mismatch"
+    assert calls == 0
 
 
 def test_policy_can_deny_registered_tool():

@@ -152,10 +152,7 @@ class ToolPolicy:
                 Decision.REQUIRE_APPROVAL,
                 "irreversible side effect requires approval",
             )
-        if (
-            tool.risk is RiskLevel.MEDIUM
-            and self.config.require_approval_for_medium_risk
-        ):
+        if tool.risk is RiskLevel.MEDIUM and self.config.require_approval_for_medium_risk:
             return PolicyResult(Decision.REQUIRE_APPROVAL, "medium-risk tool requires approval")
         if (
             tool.side_effect is SideEffect.REVERSIBLE
@@ -220,9 +217,7 @@ class GovernedAgentRuntime:
         self.max_steps = max_steps
 
     @staticmethod
-    def _idempotency_key(action: PlannedAction) -> str:
-        if action.idempotency_key:
-            return action.idempotency_key
+    def _request_sha256(action: PlannedAction) -> str:
         canonical = json.dumps(
             {"tool": action.tool, "arguments": action.arguments},
             sort_keys=True,
@@ -230,6 +225,10 @@ class GovernedAgentRuntime:
             default=str,
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _idempotency_key(cls, action: PlannedAction) -> str:
+        return action.idempotency_key or cls._request_sha256(action)
 
     def execute(
         self,
@@ -257,6 +256,7 @@ class GovernedAgentRuntime:
                     )
                 break
 
+            request_sha256 = self._request_sha256(action)
             key = self._idempotency_key(action)
             try:
                 tool = self.registry.get(action.tool)
@@ -306,7 +306,21 @@ class GovernedAgentRuntime:
                 )
                 continue
 
-            cached = self.ledger.get(key) if tool.idempotent else None
+            try:
+                cached = self.ledger.get_for_request(key, request_sha256) if tool.idempotent else None
+            except IdempotencyPayloadMismatchError:
+                trace.results.append(
+                    ActionResult(
+                        action.action_id,
+                        action.tool,
+                        ActionStatus.FAILED,
+                        None,
+                        "idempotency_key_payload_mismatch",
+                        policy_result,
+                        key,
+                    )
+                )
+                continue
             if cached is not None:
                 trace.results.append(
                     ActionResult(
@@ -342,7 +356,21 @@ class GovernedAgentRuntime:
                 continue
 
             if tool.idempotent:
-                self.ledger.record(key, output)
+                try:
+                    self.ledger.record_for_request(key, request_sha256, output)
+                except IdempotencyPayloadMismatchError:
+                    trace.results.append(
+                        ActionResult(
+                            action.action_id,
+                            action.tool,
+                            ActionStatus.FAILED,
+                            None,
+                            "idempotency_key_payload_mismatch",
+                            policy_result,
+                            key,
+                        )
+                    )
+                    continue
             trace.results.append(
                 ActionResult(
                     action.action_id,
