@@ -229,6 +229,7 @@ src/governed_runtime.py        policy, approvals, idempotency, bounded execution
 src/dag_execution.py           validated dependency DAG execution
 src/request_identity.py        shared strict canonical tool-request identity
 src/sqlite_ledger.py            restart-safe SQLite idempotency and operational snapshot adapter
+src/sqlite_binding_migration.py backup-first reviewed legacy-binding migration
 src/reconciliation.py          authenticated unknown-outcome receipts
 src/reconciliation_adapter.py  authoritative downstream status-to-receipt boundary
 src/http_reconciliation_provider.py  bounded mTLS JSON provider adapter
@@ -238,6 +239,7 @@ src/postgres_authority_checkpoint_store.py  serializable checkpoint CAS and atom
 tools/mtls_reconciliation_sandbox.py disposable live-TLS fault-injection endpoint
 tools/replicated_status_model.py deterministic acknowledged-write failover model
 tools/postgres_authority_failover_drill.py PostgreSQL promotion drill and offline evidence-chain audit
+tools/migrate_sqlite_bindings.py private reviewed-mapping migration CLI
 deploy/postgres-failover/     disposable PostgreSQL 17 primary/standby topology
 docs/retry-authorization.md    signed no-commit decisions and retry threat model
 docs/ledger-observability.md    key-free gauges, durable counters and alerting boundary
@@ -257,6 +259,7 @@ GitHub Actions validates the full public engineering surface:
 - idempotent replay;
 - fail-closed idempotency-key payload binding;
 - cross-runtime canonical request identity and aggregate-only legacy binding inventory;
+- backup-first exact-coverage migration for reviewed legacy request bindings;
 - restart-safe SQLite replay and concurrent terminal-result protection;
 - 64-worker claim contention, fencing-token rotation and unknown-outcome reconciliation;
 - restart-safe retry-budget exhaustion and legacy schema migration;
