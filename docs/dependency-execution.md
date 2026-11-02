@@ -57,6 +57,43 @@ legacy null bindings and malformed digests. It does not select keys, outputs or 
 and it never replays, deletes or upgrades a row. Operators must explicitly quarantine or migrate
 every unsafe row before treating the database as request-bound.
 
+The backup-first migration command accepts a private, reviewed mapping for every null-bound
+terminal row. Each entry contains the ledger key, canonical tool and arguments, the independently
+reviewed request digest, and the SHA-256 of the row's exact stored `output_json` text:
+
+```json
+{
+  "schema_version": "sqlite-binding-mapping/v1",
+  "entries": [
+    {
+      "key": "write:reviewed-key",
+      "tool": "write",
+      "arguments": {"value": 7},
+      "request_sha256": "<canonical tool-and-arguments SHA-256>",
+      "output_sha256": "<stored output_json SHA-256>"
+    }
+  ]
+}
+```
+
+Run it offline while no runtime is using the ledger:
+
+```bash
+python -m tools.migrate_sqlite_bindings \
+  --database runtime.db \
+  --mapping reviewed-bindings.json \
+  --backup runtime.pre-binding-migration.db \
+  --receipt binding-migration-receipt.json
+```
+
+The command creates a mode-`0600` SQLite backup before obtaining the migration transaction. It
+then requires exact mapping coverage, recomputes every canonical request digest, verifies each
+current output digest, rejects malformed or already-bound rows and active claims, and updates only
+rows whose binding is still null. The receipt retains only the backup, mapping and aggregate
+binding commitments; it excludes keys, arguments and outputs. A failed validation leaves the
+source unchanged and preserves the backup for investigation. The mapping and backup are sensitive
+operational artifacts and must not be committed.
+
 Before a new idempotent handler starts, the adapter atomically creates a lease and returns a
 monotonically increasing fencing token. A handler that writes to a dependency should propagate it:
 
@@ -126,7 +163,7 @@ unknown-outcome gate prevents automatic replay but cannot undo or prove a remote
 tools therefore still need downstream idempotency keys, transport deadlines, authenticated
 receipts, reconciliation and a distributed coordinator when execution spans hosts or regions.
 
-The next production step is an explicit, backup-first migration command that accepts a reviewed
-key-to-request mapping and refuses to overwrite any already-bound row. SQLite remains a single-host
-reference adapter, not a distributed coordinator.
+This migration authenticates operator-reviewed associations; it cannot reconstruct or prove the
+request that originally produced a legacy result. SQLite remains a single-host reference adapter,
+not a distributed coordinator.
 
