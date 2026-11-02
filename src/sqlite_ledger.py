@@ -41,6 +41,31 @@ class RetryBudgetExhaustedError(RuntimeError):
         super().__init__(f"retry budget exhausted ({retry_count}/{retry_limit})")
 
 
+class LedgerInventoryError(RuntimeError):
+    """A read-only legacy-binding inventory could not be completed safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalBindingInventory:
+    """Aggregate-only inventory of terminal request bindings."""
+
+    schema_version: int
+    terminal_results: int
+    bound_results: int
+    legacy_unbound_results: int
+    invalid_digest_results: int
+
+    @property
+    def requires_migration(self) -> bool:
+        return self.legacy_unbound_results > 0 or self.invalid_digest_results > 0
+
+    def as_dict(self) -> dict[str, int | bool]:
+        return {
+            **asdict(self),
+            "requires_migration": self.requires_migration,
+        }
+
+
 class ClaimDisposition(StrEnum):
     ACQUIRED = "acquired"
     REPLAYED = "replayed"
@@ -108,6 +133,60 @@ _METRIC_COLUMNS = frozenset(
         "retry_budget_exhausted_total",
     }
 )
+
+
+def inspect_terminal_bindings(
+    database: str | os.PathLike[str],
+) -> TerminalBindingInventory:
+    """Inspect binding counts through a read-only connection without reading payloads."""
+    if os.fspath(database) == ":memory:":
+        raise LedgerInventoryError("ledger_inventory_requires_file")
+    path = Path(database)
+    if not path.is_file():
+        raise LedgerInventoryError("ledger_unavailable")
+    try:
+        with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only = ON")
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'execution_ledger'"
+            ).fetchone()
+            if table is None:
+                raise LedgerInventoryError("execution_ledger_missing")
+            columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(execution_ledger)")}
+            if not {"request_sha256", "output_json"}.issubset(columns):
+                raise LedgerInventoryError("execution_ledger_schema_unsupported")
+            row = connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS terminal_results,
+                    COALESCE(SUM(request_sha256 IS NULL), 0) AS legacy_unbound_results,
+                    COALESCE(SUM(
+                        request_sha256 IS NOT NULL AND (
+                            typeof(request_sha256) != 'text'
+                            OR length(request_sha256) != 64
+                            OR request_sha256 GLOB '*[^0-9a-f]*'
+                        )
+                    ), 0) AS invalid_digest_results
+                FROM execution_ledger
+                """
+            ).fetchone()
+    except LedgerInventoryError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise LedgerInventoryError("ledger_inventory_failed") from exc
+    if row is None:
+        raise LedgerInventoryError("ledger_inventory_failed")
+    total = int(row["terminal_results"])
+    unbound = int(row["legacy_unbound_results"])
+    invalid = int(row["invalid_digest_results"])
+    return TerminalBindingInventory(
+        schema_version=1,
+        terminal_results=total,
+        bound_results=total - unbound - invalid,
+        legacy_unbound_results=unbound,
+        invalid_digest_results=invalid,
+    )
 
 
 class SQLiteExecutionLedger(ExecutionLedger):

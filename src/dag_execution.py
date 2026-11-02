@@ -21,6 +21,7 @@ from src.governed_runtime import (
     ToolRegistry,
     ToolSpec,
 )
+from src.request_identity import CanonicalRequestError, CanonicalRequestIdentity
 from src.sqlite_ledger import (
     ClaimDisposition,
     ClaimingExecutionLedger,
@@ -225,24 +226,28 @@ class DependencyExecutor:
             except KeyError as exc:
                 raise PlanValidationError("unknown_tool") from exc
 
-            argument_bytes = _canonical_json(action.arguments)
-            arguments = cast(dict[str, Any], json.loads(argument_bytes))
-            if not isinstance(arguments, dict):
-                raise PlanValidationError("arguments_not_object")
+            try:
+                identity = CanonicalRequestIdentity.from_parts(
+                    action.tool,
+                    action.arguments,
+                    max_bytes=MAX_ARGUMENT_BYTES,
+                )
+            except CanonicalRequestError as exc:
+                raise PlanValidationError(exc.code) from exc
+            arguments = identity.arguments
             if action.idempotency_key is not None:
                 _validate_identifier(action.idempotency_key, "invalid_idempotency_key")
                 raw_key = action.idempotency_key
             else:
-                raw_key = _sha256(_canonical_json({"tool": action.tool, "arguments": arguments}))
+                raw_key = identity.sha256
             key = f"{action.tool}:{raw_key}"
-            request_sha256 = _sha256(_canonical_json({"tool": action.tool, "arguments": arguments}))
             candidate = _PreparedAction(
                 action_id=action.action_id,
                 tool=tool,
                 arguments=arguments,
                 depends_on=action.depends_on,
                 idempotency_key=key,
-                request_sha256=request_sha256,
+                request_sha256=identity.sha256,
             )
             prepared.append(candidate)
             if tool.idempotent:

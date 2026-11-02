@@ -24,8 +24,10 @@ from src.governed_runtime import (
 )
 from src.sqlite_ledger import (
     ClaimDisposition,
+    LedgerInventoryError,
     SQLiteExecutionLedger,
     StaleFencingTokenError,
+    inspect_terminal_bindings,
 )
 
 
@@ -230,6 +232,48 @@ def test_existing_claim_table_migrates_with_conservative_retry_budget(tmp_path) 
     assert migrated.disposition is ClaimDisposition.UNKNOWN
     assert migrated.retry_count == 0
     assert migrated.retry_limit == 3
+
+
+def test_read_only_inventory_counts_legacy_bindings_without_payloads(tmp_path) -> None:
+    database = tmp_path / "ledger.db"
+    ledger = SQLiteExecutionLedger(database)
+    ledger.record_for_request("write:bound", "a" * 64, {"secret": "bound"})
+    ledger.record("write:legacy", {"secret": "legacy"})
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            INSERT INTO execution_ledger (key, request_sha256, output_json)
+            VALUES (?, ?, ?)
+            """,
+            ("write:invalid", "NOT-A-DIGEST", '{"secret":"invalid"}'),
+        )
+
+    inventory = inspect_terminal_bindings(database)
+
+    assert inventory.as_dict() == {
+        "schema_version": 1,
+        "terminal_results": 3,
+        "bound_results": 1,
+        "legacy_unbound_results": 1,
+        "invalid_digest_results": 1,
+        "requires_migration": True,
+    }
+    serialized = json.dumps(inventory.as_dict(), sort_keys=True)
+    assert "write:" not in serialized
+    assert "secret" not in serialized
+
+
+def test_read_only_inventory_does_not_create_or_migrate_databases(tmp_path) -> None:
+    missing = tmp_path / "missing.db"
+    with pytest.raises(LedgerInventoryError, match="ledger_unavailable"):
+        inspect_terminal_bindings(missing)
+    assert not missing.exists()
+
+    unsupported = tmp_path / "unsupported.db"
+    with sqlite3.connect(unsupported) as connection:
+        connection.execute("CREATE TABLE unrelated (value TEXT)")
+    with pytest.raises(LedgerInventoryError, match="execution_ledger_missing"):
+        inspect_terminal_bindings(unsupported)
 
 
 def test_concurrent_workers_obtain_exactly_one_execution_claim(tmp_path) -> None:

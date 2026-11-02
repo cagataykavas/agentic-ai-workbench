@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
+
+from src.request_identity import CanonicalRequestError, CanonicalRequestIdentity
 
 
 class RiskLevel(str, Enum):
@@ -218,17 +218,18 @@ class GovernedAgentRuntime:
 
     @staticmethod
     def _request_sha256(action: PlannedAction) -> str:
-        canonical = json.dumps(
-            {"tool": action.tool, "arguments": action.arguments},
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        )
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return CanonicalRequestIdentity.from_parts(action.tool, action.arguments).sha256
 
     @classmethod
     def _idempotency_key(cls, action: PlannedAction) -> str:
         return action.idempotency_key or cls._request_sha256(action)
+
+    @classmethod
+    def _trace_idempotency_key(cls, action: PlannedAction) -> str:
+        try:
+            return cls._idempotency_key(action)
+        except CanonicalRequestError:
+            return "invalid-request"
 
     def execute(
         self,
@@ -251,13 +252,31 @@ class GovernedAgentRuntime:
                             output=None,
                             error=None,
                             policy=PolicyResult(Decision.DENY, "execution step budget exhausted"),
-                            idempotency_key=self._idempotency_key(remaining),
+                            idempotency_key=self._trace_idempotency_key(remaining),
                         )
                     )
                 break
 
-            request_sha256 = self._request_sha256(action)
-            key = self._idempotency_key(action)
+            try:
+                identity = CanonicalRequestIdentity.from_parts(
+                    action.tool,
+                    action.arguments,
+                )
+            except CanonicalRequestError as exc:
+                trace.results.append(
+                    ActionResult(
+                        action.action_id,
+                        action.tool,
+                        ActionStatus.FAILED,
+                        None,
+                        exc.code,
+                        PolicyResult(Decision.DENY, "invalid canonical request"),
+                        action.idempotency_key or "invalid-request",
+                    )
+                )
+                continue
+            request_sha256 = identity.sha256
+            key = action.idempotency_key or identity.sha256
             try:
                 tool = self.registry.get(action.tool)
             except KeyError as exc:
@@ -337,8 +356,8 @@ class GovernedAgentRuntime:
 
             try:
                 if tool.validator:
-                    tool.validator(action.arguments)
-                output = tool.handler(dict(action.arguments))
+                    tool.validator(identity.arguments)
+                output = tool.handler(dict(identity.arguments))
                 if not isinstance(output, dict):
                     raise TypeError("tool handlers must return dictionaries")
             except (TypeError, ValueError, RuntimeError, OSError) as exc:

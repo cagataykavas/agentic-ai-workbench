@@ -1,3 +1,5 @@
+import math
+
 from src.governed_runtime import (
     ActionStatus,
     ExecutionLedger,
@@ -162,6 +164,27 @@ def test_legacy_key_only_entry_fails_closed_without_dispatch():
 
     assert result.results[0].status is ActionStatus.FAILED
     assert result.results[0].error == "idempotency_key_payload_mismatch"
+    assert calls == 0
+
+
+def test_noncanonical_arguments_fail_before_tool_dispatch():
+    calls = 0
+
+    def handler(_args: dict) -> dict:
+        nonlocal calls
+        calls += 1
+        return {"saved": True}
+
+    registry = ToolRegistry()
+    registry.register(ToolSpec("save", "save record", handler))
+    result = GovernedAgentRuntime(registry).execute(
+        "reject noncanonical request",
+        [PlannedAction("save", "save", {"value": math.nan})],
+    )
+
+    assert result.results[0].status is ActionStatus.FAILED
+    assert result.results[0].error == "invalid_json_arguments"
+    assert result.results[0].idempotency_key == "invalid-request"
     assert calls == 0
 
 

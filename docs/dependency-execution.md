@@ -36,6 +36,27 @@ uses an immediate transaction to serialize competing commits. A replacement proc
 same database therefore replays the prior success or rejects a changed request digest without
 calling the tool again.
 
+Both the basic governed runtime and this dependency executor construct request identities through
+the same strict `CanonicalRequestIdentity` contract. It snapshots JSON arguments, rejects NaN,
+infinity, non-object or oversized inputs, and hashes the canonical tool-and-arguments document.
+This prevents the two execution paths from disagreeing about whether a persisted result belongs to
+a request.
+
+Before upgrading a database that may contain older key-only terminal rows, inspect it without
+opening the mutating ledger adapter:
+
+```python
+from src.sqlite_ledger import inspect_terminal_bindings
+
+inventory = inspect_terminal_bindings("runtime.db")
+print(inventory.as_dict())
+```
+
+The inspection uses SQLite read-only/query-only mode and returns counts only: valid bindings,
+legacy null bindings and malformed digests. It does not select keys, outputs or request digests,
+and it never replays, deletes or upgrades a row. Operators must explicitly quarantine or migrate
+every unsafe row before treating the database as request-bound.
+
 Before a new idempotent handler starts, the adapter atomically creates a lease and returns a
 monotonically increasing fencing token. A handler that writes to a dependency should propagate it:
 
@@ -105,6 +126,7 @@ unknown-outcome gate prevents automatic replay but cannot undo or prove a remote
 tools therefore still need downstream idempotency keys, transport deadlines, authenticated
 receipts, reconciliation and a distributed coordinator when execution spans hosts or regions.
 
-The next production step is lease/unknown metrics and alerts plus a real remote status adapter that
-issues success or retry receipts from authoritative downstream state. SQLite remains a single-host
+The next production step is an explicit, backup-first migration command that accepts a reviewed
+key-to-request mapping and refuses to overwrite any already-bound row. SQLite remains a single-host
 reference adapter, not a distributed coordinator.
+
