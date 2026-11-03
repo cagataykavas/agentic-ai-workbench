@@ -144,6 +144,34 @@ The trace also records why execution stopped. It can be serialized to plain dict
 
 These metrics are intentionally about **agent workflow behavior**, not LLM eloquence.
 
+For benchmark or release decisions, `evaluate_traces` validates a bounded set of complete runtime
+traces before applying one prespecified `RuntimeGatePolicy`:
+
+```python
+from src.runtime_eval import RuntimeGatePolicy, evaluate_traces
+
+report = evaluate_traces(
+    benchmark_traces,
+    RuntimeGatePolicy(
+        minimum_planned_actions=500,
+        minimum_success_rate=0.90,
+        maximum_failure_rate=0.02,
+        maximum_denial_rate=0.01,
+        maximum_budget_skip_rate=0.01,
+        minimum_completed_trace_rate=0.95,
+    ),
+)
+if not report.passed:
+    raise RuntimeError(report.violations)
+```
+
+The gate rejects missing or duplicate action results, unsupported stop reasons, inconsistent
+budget-stop evidence, unbounded input sets and non-finite thresholds. Its report contains only
+aggregate counts, rates and stable violation codes—never tasks, tool names, arguments, outputs,
+errors, policy reasons or idempotency keys. Every report commits to the exact threshold policy with
+a domain-separated SHA-256. Rates are exact descriptive aggregates: the gate does not claim
+statistical independence, uncertainty bounds or representativeness of the supplied benchmark set.
+
 ## Example
 
 ```python
@@ -244,7 +272,7 @@ deploy/postgres-failover/     disposable PostgreSQL 17 primary/standby topology
 docs/retry-authorization.md    signed no-commit decisions and retry threat model
 docs/ledger-observability.md    key-free gauges, durable counters and alerting boundary
 docs/authoritative-reconciliation.md  provider contract, deadlines and trust boundary
-src/runtime_eval.py            trace-level operational metrics
+src/runtime_eval.py            trace metrics and bounded aggregate release gate
 human_agent_collaboration.py   human/agent routing example
 workflow_experiment.py         workflow comparison metrics
 tests/                         executable runtime contracts
@@ -274,7 +302,7 @@ GitHub Actions validates the full public engineering surface:
   integrity, pairing and transition audit of the archived evidence chain;
 - live CA/server/client certificate generation, mutual-TLS handshake and timeout-after-observation;
 - execution budget handling;
-- trace evaluation;
+- integrity-checked aggregate trace evaluation and prespecified release thresholds;
 - deterministic demo smoke test;
 - packaged runtime import.
 
