@@ -172,6 +172,41 @@ errors, policy reasons or idempotency keys. Every report commits to the exact th
 a domain-separated SHA-256. Rates are exact descriptive aggregates: the gate does not claim
 statistical independence, uncertainty bounds or representativeness of the supplied benchmark set.
 
+`src/runtime_eval_manifest.py` can bind that aggregate report to the reviewed scenario-suite
+digest, runtime version and source revision before a release gate consumes it:
+
+```python
+from src.runtime_eval_manifest import (
+    dump_runtime_benchmark_manifest,
+    sign_runtime_benchmark_manifest,
+    verify_runtime_benchmark_manifest,
+)
+
+manifest = sign_runtime_benchmark_manifest(
+    report,
+    scenario_suite_sha256=scenario_suite_sha256,
+    runtime_version="agent-runtime-0.2.0",
+    source_revision=source_revision,
+    key_id="benchmark-signing-v1",
+    secret=signing_secret,
+)
+serialized = dump_runtime_benchmark_manifest(manifest)
+verify_runtime_benchmark_manifest(
+    report,
+    manifest,
+    expected_scenario_suite_sha256=scenario_suite_sha256,
+    expected_runtime_version="agent-runtime-0.2.0",
+    expected_source_revision=source_revision,
+    keyring={"benchmark-signing-v1": verification_secret},
+)
+```
+
+The bounded canonical JSON loader rejects duplicate, unknown and non-canonical fields. The
+manifest carries aggregate commitments only, so private traces stay outside the release artifact.
+Its HMAC-SHA256 signature is a shared-secret authenticity boundary—not public-key provenance.
+Protect and rotate the signing key, review how the scenario-suite digest is produced, and use a
+separate artifact-attestation system when independent verification is required.
+
 ## Example
 
 ```python
@@ -273,6 +308,7 @@ docs/retry-authorization.md    signed no-commit decisions and retry threat model
 docs/ledger-observability.md    key-free gauges, durable counters and alerting boundary
 docs/authoritative-reconciliation.md  provider contract, deadlines and trust boundary
 src/runtime_eval.py            trace metrics and bounded aggregate release gate
+src/runtime_eval_manifest.py   authenticated benchmark and release provenance manifest
 human_agent_collaboration.py   human/agent routing example
 workflow_experiment.py         workflow comparison metrics
 tests/                         executable runtime contracts
