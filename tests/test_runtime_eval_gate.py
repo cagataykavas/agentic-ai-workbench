@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -13,6 +14,7 @@ from src.governed_runtime import (
     PolicyResult,
 )
 from src.runtime_eval import (
+    RUNTIME_GATE_VIOLATION_CODES,
     RuntimeEvaluationError,
     RuntimeGatePolicy,
     evaluate_traces,
@@ -272,3 +274,59 @@ def test_gate_rejects_non_trace_members_and_wrong_policy_type() -> None:
         evaluate_traces([object()], RuntimeGatePolicy())  # type: ignore[list-item]
     with pytest.raises(TypeError, match="policy must be RuntimeGatePolicy"):
         evaluate_traces([_trace("valid", [])], object())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("executed_actions", 0, "executed status counts"),
+        ("succeeded_actions", 2, "status counts"),
+        ("success_rate", 0.5, "aggregate count"),
+        ("completed_trace_rate", 0.25, "inconsistent with trace_count"),
+        ("failure_rate", -0.0, "aggregate count"),
+        ("planned_actions", True, "must be an integer"),
+        ("failure_rate", math.nan, "finite float"),
+    ],
+)
+def test_aggregate_report_rejects_impossible_counts_or_rates(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    report = evaluate_traces(
+        [_trace("one", [ActionStatus.SUCCEEDED]), _trace("two", [])],
+        RuntimeGatePolicy(),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        replace(report.metrics, **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("violations", "message"),
+    [
+        (("unknown_violation",), "unsupported code"),
+        ((RUNTIME_GATE_VIOLATION_CODES[0],) * 2, "duplicates"),
+        (
+            (RUNTIME_GATE_VIOLATION_CODES[1], RUNTIME_GATE_VIOLATION_CODES[0]),
+            "canonical ordering",
+        ),
+    ],
+)
+def test_report_rejects_noncanonical_violation_sets(
+    violations: tuple[str, ...],
+    message: str,
+) -> None:
+    report = evaluate_traces([_trace("valid", [])], RuntimeGatePolicy())
+
+    with pytest.raises(ValueError, match=message):
+        replace(report, violations=violations)
+
+
+def test_report_rejects_invalid_policy_commitment_and_container_types() -> None:
+    report = evaluate_traces([_trace("valid", [])], RuntimeGatePolicy())
+
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        replace(report, policy_sha256="not-a-digest")
+    with pytest.raises(TypeError, match="violations must be a tuple"):
+        replace(report, violations=[])  # type: ignore[arg-type]

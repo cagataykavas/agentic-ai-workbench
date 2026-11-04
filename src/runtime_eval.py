@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 
@@ -16,6 +17,17 @@ from src.governed_runtime import (
 
 MAX_EVALUATION_TRACES = 10_000
 MAX_EVALUATION_ACTIONS = 1_000_000
+RUNTIME_GATE_VIOLATION_CODES = (
+    "minimum_planned_actions_not_met",
+    "success_rate_below_minimum",
+    "failure_rate_above_maximum",
+    "approval_rate_above_maximum",
+    "denial_rate_above_maximum",
+    "replay_rate_above_maximum",
+    "budget_skip_rate_above_maximum",
+    "completed_trace_rate_below_minimum",
+)
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class RuntimeEvaluationError(RuntimeError):
@@ -105,6 +117,70 @@ class AggregateRuntimeMetrics:
     budget_skip_rate: float
     completed_trace_rate: float
 
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Reject impossible aggregate reports, including post-init mutation."""
+        count_bounds = {
+            "trace_count": MAX_EVALUATION_TRACES,
+            "planned_actions": MAX_EVALUATION_ACTIONS,
+            "executed_actions": MAX_EVALUATION_ACTIONS,
+            "succeeded_actions": MAX_EVALUATION_ACTIONS,
+            "failed_actions": MAX_EVALUATION_ACTIONS,
+            "awaiting_approval_actions": MAX_EVALUATION_ACTIONS,
+            "denied_actions": MAX_EVALUATION_ACTIONS,
+            "replayed_actions": MAX_EVALUATION_ACTIONS,
+            "budget_skipped_actions": MAX_EVALUATION_ACTIONS,
+        }
+        for name, maximum in count_bounds.items():
+            value = getattr(self, name)
+            minimum = 1 if name == "trace_count" else 0
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+
+        status_total = (
+            self.succeeded_actions
+            + self.failed_actions
+            + self.awaiting_approval_actions
+            + self.denied_actions
+            + self.replayed_actions
+            + self.budget_skipped_actions
+        )
+        if status_total != self.planned_actions:
+            raise ValueError("aggregate status counts must equal planned_actions")
+        if self.executed_actions != (self.succeeded_actions + self.failed_actions + self.replayed_actions):
+            raise ValueError("executed_actions must equal executed status counts")
+
+        denominator = self.planned_actions or 1
+        rate_counts = {
+            "success_rate": self.succeeded_actions,
+            "failure_rate": self.failed_actions,
+            "approval_rate": self.awaiting_approval_actions,
+            "denial_rate": self.denied_actions,
+            "replay_rate": self.replayed_actions,
+            "budget_skip_rate": self.budget_skipped_actions,
+        }
+        for name, count in rate_counts.items():
+            value = getattr(self, name)
+            if type(value) is not float or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite float")
+            expected = count / denominator
+            if value.hex() != expected.hex():
+                raise ValueError(f"{name} does not match its aggregate count")
+
+        completed_rate = self.completed_trace_rate
+        if (
+            type(completed_rate) is not float
+            or not math.isfinite(completed_rate)
+            or not 0.0 <= completed_rate <= 1.0
+        ):
+            raise ValueError("completed_trace_rate must be a finite float in [0, 1]")
+        completed_traces = round(completed_rate * self.trace_count)
+        expected_completed_rate = completed_traces / self.trace_count
+        if completed_rate.hex() != expected_completed_rate.hex():
+            raise ValueError("completed_trace_rate is inconsistent with trace_count")
+
 
 @dataclass(frozen=True, slots=True)
 class RuntimeGateReport:
@@ -113,6 +189,28 @@ class RuntimeGateReport:
     metrics: AggregateRuntimeMetrics
     policy_sha256: str
     violations: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Revalidate the complete aggregate artifact before trust decisions."""
+        if not isinstance(self.metrics, AggregateRuntimeMetrics):
+            raise TypeError("metrics must be AggregateRuntimeMetrics")
+        self.metrics.validate()
+        if not isinstance(self.policy_sha256, str) or _SHA256.fullmatch(self.policy_sha256) is None:
+            raise ValueError("policy_sha256 must be a lowercase SHA-256 digest")
+        if not isinstance(self.violations, tuple):
+            raise TypeError("violations must be a tuple")
+        positions = {code: index for index, code in enumerate(RUNTIME_GATE_VIOLATION_CODES)}
+        try:
+            observed_positions = tuple(positions[code] for code in self.violations)
+        except (KeyError, TypeError) as exc:
+            raise ValueError("violations contain an unsupported code") from exc
+        if len(set(self.violations)) != len(self.violations):
+            raise ValueError("violations must not contain duplicates")
+        if observed_positions != tuple(sorted(observed_positions)):
+            raise ValueError("violations must use canonical ordering")
 
     @property
     def passed(self) -> bool:
