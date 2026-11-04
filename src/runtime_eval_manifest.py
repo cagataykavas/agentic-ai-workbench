@@ -4,18 +4,27 @@ import hashlib
 import hmac
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
-from src.runtime_eval import MAX_EVALUATION_ACTIONS, MAX_EVALUATION_TRACES, RuntimeGateReport
+from src.governed_runtime import ExecutionTrace
+from src.runtime_eval import (
+    MAX_EVALUATION_ACTIONS,
+    MAX_EVALUATION_TRACES,
+    RuntimeEvaluationError,
+    RuntimeGatePolicy,
+    RuntimeGateReport,
+    evaluate_traces,
+)
 
-SCHEMA_VERSION = "runtime-benchmark-manifest/v1"
+SCHEMA_VERSION = "runtime-benchmark-manifest/v2"
 MAX_MANIFEST_BYTES = 32_768
 MAX_KEYRING_KEYS = 16
 _MANIFEST_FIELDS = frozenset(
     {
         "key_id",
+        "evaluation_evidence_sha256",
         "planned_actions",
         "policy_sha256",
         "report_sha256",
@@ -27,8 +36,9 @@ _MANIFEST_FIELDS = frozenset(
         "trace_count",
     }
 )
-_DOMAIN = b"agentic-ai-runtime-benchmark-manifest-v1\0"
+_DOMAIN = b"agentic-ai-runtime-benchmark-manifest-v2\0"
 _REPORT_DOMAIN = b"agentic-ai-runtime-gate-report-v1\0"
+_EVIDENCE_DOMAIN = b"agentic-ai-runtime-evaluation-evidence-v1\0"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SOURCE_REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}")
@@ -48,6 +58,7 @@ class RuntimeBenchmarkManifest:
 
     schema_version: str
     scenario_suite_sha256: str
+    evaluation_evidence_sha256: str
     runtime_version: str
     source_revision: str
     policy_sha256: str
@@ -61,6 +72,7 @@ class RuntimeBenchmarkManifest:
         if self.schema_version != SCHEMA_VERSION:
             raise ValueError("schema_version is unsupported")
         _require_sha256(self.scenario_suite_sha256, "scenario_suite_sha256")
+        _require_sha256(self.evaluation_evidence_sha256, "evaluation_evidence_sha256")
         _require_identifier(self.runtime_version, "runtime_version")
         if (
             not isinstance(self.source_revision, str)
@@ -87,6 +99,7 @@ class RuntimeBenchmarkManifest:
     def unsigned_document(self) -> dict[str, str | int]:
         return {
             "key_id": self.key_id,
+            "evaluation_evidence_sha256": self.evaluation_evidence_sha256,
             "planned_actions": self.planned_actions,
             "policy_sha256": self.policy_sha256,
             "report_sha256": self.report_sha256,
@@ -109,6 +122,7 @@ def sign_runtime_benchmark_manifest(
     report: RuntimeGateReport,
     *,
     scenario_suite_sha256: str,
+    evaluation_evidence_sha256: str,
     runtime_version: str,
     source_revision: str,
     key_id: str,
@@ -120,6 +134,7 @@ def sign_runtime_benchmark_manifest(
     unsigned = {
         "schema_version": SCHEMA_VERSION,
         "scenario_suite_sha256": scenario_suite_sha256,
+        "evaluation_evidence_sha256": evaluation_evidence_sha256,
         "runtime_version": runtime_version,
         "source_revision": source_revision,
         "policy_sha256": report.policy_sha256,
@@ -142,6 +157,7 @@ def verify_runtime_benchmark_manifest(
     manifest: RuntimeBenchmarkManifest,
     *,
     expected_scenario_suite_sha256: str,
+    expected_evaluation_evidence_sha256: str,
     expected_runtime_version: str,
     expected_source_revision: str,
     keyring: Mapping[str, bytes],
@@ -172,6 +188,11 @@ def verify_runtime_benchmark_manifest(
         _validated_sha256(expected_scenario_suite_sha256, "expected scenario suite"),
     ):
         raise RuntimeBenchmarkManifestError("manifest_scenario_suite_mismatch")
+    if not hmac.compare_digest(
+        manifest.evaluation_evidence_sha256,
+        _validated_sha256(expected_evaluation_evidence_sha256, "expected evaluation evidence"),
+    ):
+        raise RuntimeBenchmarkManifestError("manifest_evaluation_evidence_mismatch")
     if manifest.runtime_version != expected_runtime_version:
         raise RuntimeBenchmarkManifestError("manifest_runtime_version_mismatch")
     if manifest.source_revision != expected_source_revision:
@@ -185,6 +206,91 @@ def verify_runtime_benchmark_manifest(
     if not hmac.compare_digest(manifest.report_sha256, _report_sha256(report)):
         raise RuntimeBenchmarkManifestError("manifest_report_mismatch")
     return manifest.sha256
+
+
+def runtime_evaluation_evidence_sha256(traces: Sequence[ExecutionTrace]) -> str:
+    """Commit to gate-relevant trace evidence without retaining private payload values."""
+    evaluate_traces(traces, RuntimeGatePolicy())
+    hasher = hashlib.sha256(_EVIDENCE_DOMAIN)
+    _update_evidence_digest(hasher, {"trace_count": len(traces)})
+    for trace in traces:
+        _update_evidence_digest(
+            hasher,
+            {
+                "max_steps": trace.max_steps,
+                "planned_actions": trace.planned_actions,
+                "result_count": len(trace.results),
+                "stopped_reason": trace.stopped_reason,
+            },
+        )
+        for result in trace.results:
+            _update_evidence_digest(
+                hasher,
+                {
+                    "action_id": result.action_id,
+                    "error_kind": "text" if result.error is not None else "none",
+                    "output_kind": "mapping" if result.output is not None else "none",
+                    "policy_decision": result.policy.decision.value,
+                    "status": result.status.value,
+                },
+            )
+    return hasher.hexdigest()
+
+
+def evaluate_and_sign_runtime_benchmark(
+    traces: Sequence[ExecutionTrace],
+    policy: RuntimeGatePolicy,
+    *,
+    scenario_suite_sha256: str,
+    runtime_version: str,
+    source_revision: str,
+    key_id: str,
+    secret: bytes,
+) -> tuple[RuntimeGateReport, RuntimeBenchmarkManifest]:
+    """Recompute a stable trace-set report before signing its provenance."""
+    evidence_before = runtime_evaluation_evidence_sha256(traces)
+    report = evaluate_traces(traces, policy)
+    evidence_after = runtime_evaluation_evidence_sha256(traces)
+    if not hmac.compare_digest(evidence_before, evidence_after):
+        raise RuntimeEvaluationError("trace_set_changed_during_evaluation")
+    manifest = sign_runtime_benchmark_manifest(
+        report,
+        scenario_suite_sha256=scenario_suite_sha256,
+        evaluation_evidence_sha256=evidence_after,
+        runtime_version=runtime_version,
+        source_revision=source_revision,
+        key_id=key_id,
+        secret=secret,
+    )
+    return report, manifest
+
+
+def evaluate_and_verify_runtime_benchmark(
+    traces: Sequence[ExecutionTrace],
+    policy: RuntimeGatePolicy,
+    manifest: RuntimeBenchmarkManifest,
+    *,
+    expected_scenario_suite_sha256: str,
+    expected_runtime_version: str,
+    expected_source_revision: str,
+    keyring: Mapping[str, bytes],
+) -> tuple[RuntimeGateReport, str]:
+    """Recompute a stable trace-set report before verifying its manifest."""
+    evidence_before = runtime_evaluation_evidence_sha256(traces)
+    report = evaluate_traces(traces, policy)
+    evidence_after = runtime_evaluation_evidence_sha256(traces)
+    if not hmac.compare_digest(evidence_before, evidence_after):
+        raise RuntimeEvaluationError("trace_set_changed_during_evaluation")
+    commitment = verify_runtime_benchmark_manifest(
+        report,
+        manifest,
+        expected_scenario_suite_sha256=expected_scenario_suite_sha256,
+        expected_evaluation_evidence_sha256=evidence_after,
+        expected_runtime_version=expected_runtime_version,
+        expected_source_revision=expected_source_revision,
+        keyring=keyring,
+    )
+    return report, commitment
 
 
 def dump_runtime_benchmark_manifest(manifest: RuntimeBenchmarkManifest) -> str:
@@ -233,6 +339,12 @@ def _canonical(document: Mapping[str, Any]) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("ascii")
+
+
+def _update_evidence_digest(hasher: Any, document: Mapping[str, Any]) -> None:
+    payload = _canonical(document)
+    hasher.update(len(payload).to_bytes(8, "big"))
+    hasher.update(payload)
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
