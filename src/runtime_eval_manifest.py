@@ -251,6 +251,7 @@ def _reject_constant(value: str) -> None:
 def _require_report(report: RuntimeGateReport) -> None:
     if not isinstance(report, RuntimeGateReport):
         raise TypeError("report must be a RuntimeGateReport")
+    report.validate()
 
 
 def _validated_keyring(keyring: Mapping[str, bytes]) -> dict[str, bytes]:

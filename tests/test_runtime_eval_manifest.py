@@ -87,6 +87,14 @@ def test_signed_manifest_round_trips_and_verifies_commitment() -> None:
     assert _verify(report, loaded) == manifest.sha256
 
 
+def test_signer_revalidates_report_invariants_at_the_trust_boundary() -> None:
+    report = _report()
+    object.__setattr__(report.metrics, "success_rate", 0.5)
+
+    with pytest.raises(ValueError, match="aggregate count"):
+        _manifest(report)
+
+
 def test_manifest_excludes_private_trace_payloads() -> None:
     serialized = dump_runtime_benchmark_manifest(_manifest())
 

@@ -169,8 +169,11 @@ The gate rejects missing or duplicate action results, unsupported stop reasons, 
 budget-stop evidence, unbounded input sets and non-finite thresholds. Its report contains only
 aggregate counts, rates and stable violation codes—never tasks, tool names, arguments, outputs,
 errors, policy reasons or idempotency keys. Every report commits to the exact threshold policy with
-a domain-separated SHA-256. Rates are exact descriptive aggregates: the gate does not claim
-statistical independence, uncertainty bounds or representativeness of the supplied benchmark set.
+a domain-separated SHA-256. Aggregate report objects also revalidate count totals, exact rates,
+completed-trace granularity, policy digests, and canonical violation ordering whenever a manifest
+signer or verifier crosses the trust boundary. Rates are exact descriptive aggregates: the gate
+does not claim statistical independence, uncertainty bounds or representativeness of the supplied
+benchmark set.
 
 `src/runtime_eval_manifest.py` can bind that aggregate report to the reviewed scenario-suite
 digest, runtime version and source revision before a release gate consumes it:
