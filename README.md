@@ -150,17 +150,15 @@ traces before applying one prespecified `RuntimeGatePolicy`:
 ```python
 from src.runtime_eval import RuntimeGatePolicy, evaluate_traces
 
-report = evaluate_traces(
-    benchmark_traces,
-    RuntimeGatePolicy(
-        minimum_planned_actions=500,
-        minimum_success_rate=0.90,
-        maximum_failure_rate=0.02,
-        maximum_denial_rate=0.01,
-        maximum_budget_skip_rate=0.01,
-        minimum_completed_trace_rate=0.95,
-    ),
+policy = RuntimeGatePolicy(
+    minimum_planned_actions=500,
+    minimum_success_rate=0.90,
+    maximum_failure_rate=0.02,
+    maximum_denial_rate=0.01,
+    maximum_budget_skip_rate=0.01,
+    minimum_completed_trace_rate=0.95,
 )
+report = evaluate_traces(benchmark_traces, policy)
 if not report.passed:
     raise RuntimeError(report.violations)
 ```
@@ -175,18 +173,20 @@ signer or verifier crosses the trust boundary. Rates are exact descriptive aggre
 does not claim statistical independence, uncertainty bounds or representativeness of the supplied
 benchmark set.
 
-`src/runtime_eval_manifest.py` can bind that aggregate report to the reviewed scenario-suite
-digest, runtime version and source revision before a release gate consumes it:
+`src/runtime_eval_manifest.py` can recompute a report from runtime traces and bind it to the
+reviewed scenario-suite digest, privacy-reduced evaluation evidence, runtime version and source
+revision before a release gate consumes it:
 
 ```python
 from src.runtime_eval_manifest import (
     dump_runtime_benchmark_manifest,
-    sign_runtime_benchmark_manifest,
-    verify_runtime_benchmark_manifest,
+    evaluate_and_sign_runtime_benchmark,
+    evaluate_and_verify_runtime_benchmark,
 )
 
-manifest = sign_runtime_benchmark_manifest(
-    report,
+report, manifest = evaluate_and_sign_runtime_benchmark(
+    benchmark_traces,
+    policy,
     scenario_suite_sha256=scenario_suite_sha256,
     runtime_version="agent-runtime-0.2.0",
     source_revision=source_revision,
@@ -194,8 +194,9 @@ manifest = sign_runtime_benchmark_manifest(
     secret=signing_secret,
 )
 serialized = dump_runtime_benchmark_manifest(manifest)
-verify_runtime_benchmark_manifest(
-    report,
+verified_report, manifest_commitment = evaluate_and_verify_runtime_benchmark(
+    benchmark_traces,
+    policy,
     manifest,
     expected_scenario_suite_sha256=scenario_suite_sha256,
     expected_runtime_version="agent-runtime-0.2.0",
@@ -204,11 +205,20 @@ verify_runtime_benchmark_manifest(
 )
 ```
 
-The bounded canonical JSON loader rejects duplicate, unknown and non-canonical fields. The
-manifest carries aggregate commitments only, so private traces stay outside the release artifact.
-Its HMAC-SHA256 signature is a shared-secret authenticity boundary—not public-key provenance.
-Protect and rotate the signing key, review how the scenario-suite digest is produced, and use a
-separate artifact-attestation system when independent verification is required.
+The high-level signer hashes the gate-relevant trace structure before and after evaluation and
+fails closed if it changes, so callers cannot attach an arbitrary report or unrelated trace-evidence
+digest. The evidence commitment includes trace ordering, stop reasons, action identifiers,
+statuses, policy decisions and whether outputs/errors are present. It deliberately excludes tasks,
+tool names, payload values, error text, policy reasons and idempotency keys. Different private
+payloads with the same operational shape therefore share an evidence digest; retain the underlying
+benchmark artifact under appropriate access controls when content-level auditability is required.
+
+The bounded canonical JSON loader rejects duplicate, unknown and non-canonical manifest fields.
+The signed manifest carries only aggregate values and cryptographic commitments, so private traces
+stay outside the release artifact. Its HMAC-SHA256 signature is a shared-secret authenticity
+boundary—not public-key provenance. Protect and rotate the signing key, review how the
+scenario-suite digest is produced, and use a separate artifact-attestation system when independent
+verification is required.
 
 ## Example
 
