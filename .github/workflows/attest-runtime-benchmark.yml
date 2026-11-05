@@ -1,0 +1,44 @@
+name: attest reviewed runtime benchmark
+
+on:
+  workflow_call:
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    environment: runtime-benchmark-signer
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Enforce protected default-branch invocation
+        run: |
+          test "$GITHUB_EVENT_NAME" = "push"
+          test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install benchmark signer
+        run: pip install --no-deps -e .
+      - name: Reconstruct and gate reviewed benchmark inside signer boundary
+        env:
+          RUNTIME_BENCHMARK_SIGNING_SECRET: ${{ secrets.RUNTIME_BENCHMARK_SIGNING_SECRET }}
+        run: >-
+          python tools/sign_reviewed_runtime_benchmark.py
+          --source-revision "$GITHUB_SHA"
+          --output .artifacts/runtime-benchmark-manifest.json
+      - name: Attest canonical runtime benchmark manifest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: .artifacts/runtime-benchmark-manifest.json
+      - name: Retain attested runtime benchmark manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: attested-runtime-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/runtime-benchmark-manifest.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
