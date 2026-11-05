@@ -107,3 +107,12 @@ jobs:
       id-token: write
     uses: ./.github/workflows/attest-failover-evidence.yml
 
+  attest-runtime-benchmark:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: quality
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/attest-runtime-benchmark.yml
+

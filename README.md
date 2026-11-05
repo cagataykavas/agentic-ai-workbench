@@ -239,10 +239,29 @@ python tools/verify_runtime_benchmark_attestation.py runtime-benchmark-manifest.
 
 For an air-gapped decision, also supply `--bundle`, `--trusted-root` and the immutable numeric
 `--repository-id`. Offline verification rejects every attestation result whose certificate does not
-match that repository ID. This repository currently supplies the verification boundary, not the
-trusted signer workflow or a claim of live attestation. The next deployment step is a protected
-default-branch signer that independently reconstructs the report from retained traces and the
-reviewed scenario suite before it attests this manifest.
+match that repository ID.
+
+The producer boundary is `.github/workflows/attest-runtime-benchmark.yml`. It can run only from a
+default-branch push, uses the protected `runtime-benchmark-signer` Environment, and is the only job
+granted OIDC and attestation permissions. Inside that boundary it runs the reviewed deterministic
+suite in `src/reviewed_runtime_benchmark.py` against the real governed runtime. The suite exercises
+successful reads, normalized tool failure, approval-required and approved side effects, explicit
+policy denial, idempotent replay, step-budget exhaustion, and unknown-tool denial. It checks every
+expected status and stop reason before applying prespecified aggregate thresholds, creating the
+canonical manifest, and attesting that exact file.
+
+Configure `RUNTIME_BENCHMARK_SIGNING_SECRET` as an Environment secret with at least 32 bytes and
+require reviewers on `runtime-benchmark-signer` before enabling the default-branch job. The secret
+is read only from the environment and never passed on the command line or written to the manifest.
+The manifest and console receipt contain aggregate counts and commitments rather than tasks, tool
+names, arguments, outputs, errors, policy reasons, or idempotency keys. The attested manifest is
+retained for 30 days.
+
+This controlled suite proves deterministic runtime-policy behavior, not LLM answer quality,
+benchmark representativeness, runner attestation, or model performance. The HMAC key remains a
+shared secret, and no live attestation is claimed until the workflow runs after review on the
+protected default branch. The next hardening step is key-status rotation and an independently
+retained history of accepted manifest commitments.
 
 ## Example
 
@@ -347,6 +366,8 @@ docs/authoritative-reconciliation.md  provider contract, deadlines and trust bou
 src/runtime_eval.py            trace metrics and bounded aggregate release gate
 src/runtime_eval_manifest.py   authenticated benchmark and release provenance manifest
 src/runtime_eval_attestation.py  independent GitHub attestation intake boundary
+src/reviewed_runtime_benchmark.py  deterministic governed-runtime release scenario suite
+tools/sign_reviewed_runtime_benchmark.py  protected signer and canonical manifest CLI
 tools/verify_runtime_benchmark_attestation.py  attestation verification and receipt CLI
 human_agent_collaboration.py   human/agent routing example
 workflow_experiment.py         workflow comparison metrics
