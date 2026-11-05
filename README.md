@@ -220,6 +220,30 @@ boundary—not public-key provenance. Protect and rotate the signing key, review
 scenario-suite digest is produced, and use a separate artifact-attestation system when independent
 verification is required.
 
+`tools/verify_runtime_benchmark_attestation.py` provides that independent intake boundary for a
+canonical runtime manifest that has been attested with GitHub artifact attestations. The verifier
+checks the exact expected manifest digest, immutable signer workflow commit and branch, and denies
+self-hosted runners. It verifies a private snapshot of the manifest so a concurrent file replacement
+cannot change the artifact under inspection. The emitted receipt contains only commitments and
+verification status, not repository or workflow names:
+
+```bash
+python tools/verify_runtime_benchmark_attestation.py runtime-benchmark-manifest.json \
+  --expected-manifest-sha256 "$MANIFEST_SHA256" \
+  --repository cagataykavas/agentic-ai-workbench \
+  --signer-workflow .github/workflows/attest-runtime-benchmark.yml \
+  --signer-digest "$SIGNER_WORKFLOW_COMMIT_SHA" \
+  --source-ref refs/heads/main \
+  --output runtime-benchmark-attestation-receipt.json
+```
+
+For an air-gapped decision, also supply `--bundle`, `--trusted-root` and the immutable numeric
+`--repository-id`. Offline verification rejects every attestation result whose certificate does not
+match that repository ID. This repository currently supplies the verification boundary, not the
+trusted signer workflow or a claim of live attestation. The next deployment step is a protected
+default-branch signer that independently reconstructs the report from retained traces and the
+reviewed scenario suite before it attests this manifest.
+
 ## Example
 
 ```python
@@ -322,6 +346,8 @@ docs/ledger-observability.md    key-free gauges, durable counters and alerting b
 docs/authoritative-reconciliation.md  provider contract, deadlines and trust boundary
 src/runtime_eval.py            trace metrics and bounded aggregate release gate
 src/runtime_eval_manifest.py   authenticated benchmark and release provenance manifest
+src/runtime_eval_attestation.py  independent GitHub attestation intake boundary
+tools/verify_runtime_benchmark_attestation.py  attestation verification and receipt CLI
 human_agent_collaboration.py   human/agent routing example
 workflow_experiment.py         workflow comparison metrics
 tests/                         executable runtime contracts
