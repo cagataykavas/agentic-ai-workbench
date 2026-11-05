@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from src.governed_runtime import (
     ActionStatus,
+    ExecutionTrace,
     GovernedAgentRuntime,
     PlannedAction,
     PolicyConfig,
@@ -14,14 +15,12 @@ from src.governed_runtime import (
     ToolPolicy,
     ToolRegistry,
     ToolSpec,
-    ExecutionTrace,
 )
 from src.runtime_eval import RuntimeGatePolicy, RuntimeGateReport
 from src.runtime_eval_manifest import (
     RuntimeBenchmarkManifest,
     evaluate_and_sign_runtime_benchmark,
 )
-
 
 RUNTIME_VERSION = "agent-runtime-0.2.0"
 SCENARIO_SUITE_SCHEMA = "reviewed-governed-runtime-suite/v1"

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Reconstruct and sign the reviewed runtime benchmark in protected CI."""
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ from pathlib import Path
 
 from src.reviewed_runtime_benchmark import sign_reviewed_runtime_benchmark
 from src.runtime_eval_manifest import dump_runtime_benchmark_manifest
-
 
 _ENVIRONMENT_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
 

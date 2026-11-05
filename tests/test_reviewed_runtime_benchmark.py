@@ -25,7 +25,6 @@ from src.runtime_eval_manifest import (
 )
 from tools.sign_reviewed_runtime_benchmark import main
 
-
 SOURCE_REVISION = "a" * 40
 KEY_ID = "runtime-benchmark-signing-v1"
 SECRET = b"test-only-runtime-benchmark-signing-secret-v1"
