@@ -33,6 +33,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gh-executable", default="gh")
     parser.add_argument("--timeout-seconds", type=int, default=30)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--acceptance-history",
+        type=Path,
+        help="append successful verification evidence to a private hash-chained JSONL history",
+    )
     return parser
 
 
@@ -64,8 +69,11 @@ def main(argv: list[str] | None = None) -> int:
         for optional in (args.bundle, args.trusted_root):
             if optional is not None:
                 inputs.add(optional.resolve())
-        if args.output is not None and args.output.resolve() in inputs:
+        outputs = [path for path in (args.output, args.acceptance_history) if path is not None]
+        if any(path.resolve() in inputs for path in outputs):
             raise ValueError("output must not replace an attestation input")
+        if len({path.resolve() for path in outputs}) != len(outputs):
+            raise ValueError("receipt and acceptance history must be separate files")
         policy = RuntimeBenchmarkAttestationPolicy(
             repository=args.repository,
             signer_workflow=args.signer_workflow,
@@ -81,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
             repository_id=args.repository_id,
             gh_executable=args.gh_executable,
             timeout_seconds=args.timeout_seconds,
+            acceptance_history=args.acceptance_history,
         )
         if args.output is None:
             print(json.dumps(receipt, allow_nan=False, indent=2, sort_keys=True))

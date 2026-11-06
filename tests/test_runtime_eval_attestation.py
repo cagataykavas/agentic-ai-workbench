@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,11 @@ from src.runtime_eval_attestation import (
     RuntimeBenchmarkAttestationError,
     RuntimeBenchmarkAttestationPolicy,
     verify_runtime_benchmark_attestation,
+)
+from src.runtime_eval_attestation_history import (
+    HISTORY_ENTRY_SCHEMA,
+    RuntimeBenchmarkAttestationHistoryError,
+    load_attestation_history,
 )
 from src.runtime_eval_manifest import (
     dump_runtime_benchmark_manifest,
@@ -331,3 +337,197 @@ def test_cli_writes_private_receipt_and_refuses_input_overwrite(
 
     arguments[-1] = str(manifest)
     assert main(arguments) == 2
+
+
+def test_successful_verification_appends_idempotent_private_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    expected = write_manifest(manifest)
+    history = tmp_path / "accepted-manifests.jsonl"
+    monkeypatch.setattr(
+        "src.runtime_eval_attestation.subprocess.run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    first = verify_runtime_benchmark_attestation(
+        manifest,
+        expected_manifest_sha256=expected,
+        policy=policy(),
+        acceptance_history=history,
+    )
+    second = verify_runtime_benchmark_attestation(
+        manifest,
+        expected_manifest_sha256=expected,
+        policy=policy(),
+        acceptance_history=history,
+    )
+
+    assert first == second
+    entries = load_attestation_history(history)
+    assert len(entries) == 1
+    assert entries[0] == {
+        "attestation_policy_sha256": first["attestation_policy_sha256"],
+        "entry_sha256": entries[0]["entry_sha256"],
+        "manifest_sha256": expected,
+        "previous_entry_sha256": "0" * 64,
+        "receipt_evidence_sha256": first["evidence_sha256"],
+        "schema_version": HISTORY_ENTRY_SCHEMA,
+        "sequence": 1,
+        "verification_mode": "online",
+    }
+    assert os.stat(history).st_mode & 0o777 == 0o600
+    retained = history.read_text(encoding="ascii")
+    for private_policy in (REPOSITORY, SIGNER_WORKFLOW, SOURCE_REF, REPOSITORY_ID):
+        assert private_policy not in retained
+
+
+def test_history_chains_distinct_acceptances_and_detects_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    expected = write_manifest(manifest)
+    history = tmp_path / "accepted-manifests.jsonl"
+    monkeypatch.setattr(
+        "src.runtime_eval_attestation.subprocess.run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+    for digest in ("a" * 40, "b" * 40):
+        verify_runtime_benchmark_attestation(
+            manifest,
+            expected_manifest_sha256=expected,
+            policy=policy(signer_digest=digest),
+            acceptance_history=history,
+        )
+
+    entries = load_attestation_history(history)
+    assert [entry["sequence"] for entry in entries] == [1, 2]
+    assert entries[1]["previous_entry_sha256"] == entries[0]["entry_sha256"]
+
+    history.write_bytes(history.read_bytes().splitlines(keepends=True)[1])
+    with pytest.raises(RuntimeBenchmarkAttestationHistoryError, match="chain_invalid"):
+        load_attestation_history(history)
+
+
+def test_history_serializes_concurrent_verified_acceptances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    expected = write_manifest(manifest)
+    history = tmp_path / "accepted-manifests.jsonl"
+    monkeypatch.setattr(
+        "src.runtime_eval_attestation.subprocess.run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    def verify(index: int) -> None:
+        verify_runtime_benchmark_attestation(
+            manifest,
+            expected_manifest_sha256=expected,
+            policy=policy(signer_digest=f"{index:040x}"),
+            acceptance_history=history,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(verify, range(1, 9)))
+
+    entries = load_attestation_history(history)
+    assert [entry["sequence"] for entry in entries] == list(range(1, 9))
+    assert len({entry["receipt_evidence_sha256"] for entry in entries}) == 8
+
+
+def test_failed_attestation_never_creates_acceptance_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    expected = write_manifest(manifest)
+    history = tmp_path / "accepted-manifests.jsonl"
+    monkeypatch.setattr(
+        "src.runtime_eval_attestation.subprocess.run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command, 1, stdout="", stderr="provider detail"
+        ),
+    )
+
+    with pytest.raises(RuntimeBenchmarkAttestationError, match="^attestation_invalid$"):
+        verify_runtime_benchmark_attestation(
+            manifest,
+            expected_manifest_sha256=expected,
+            policy=policy(),
+            acceptance_history=history,
+        )
+
+    assert not history.exists()
+
+
+def test_history_fails_closed_for_tampering_symlinks_and_weak_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    expected = write_manifest(manifest)
+    history = tmp_path / "accepted-manifests.jsonl"
+    monkeypatch.setattr(
+        "src.runtime_eval_attestation.subprocess.run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+    verify_runtime_benchmark_attestation(
+        manifest,
+        expected_manifest_sha256=expected,
+        policy=policy(),
+        acceptance_history=history,
+    )
+
+    document = json.loads(history.read_text(encoding="ascii"))
+    document["manifest_sha256"] = "f" * 64
+    history.write_text(json.dumps(document, separators=(",", ":"), sort_keys=True) + "\n")
+    with pytest.raises(RuntimeBenchmarkAttestationHistoryError, match="chain_invalid"):
+        load_attestation_history(history)
+
+    history.chmod(0o644)
+    with pytest.raises(RuntimeBenchmarkAttestationHistoryError, match="file_unsafe"):
+        load_attestation_history(history)
+
+    target = tmp_path / "target.jsonl"
+    target.write_text("", encoding="ascii")
+    target.chmod(0o600)
+    link = tmp_path / "history-link.jsonl"
+    link.symlink_to(target)
+    with pytest.raises(RuntimeBenchmarkAttestationHistoryError, match="unavailable"):
+        verify_runtime_benchmark_attestation(
+            manifest,
+            expected_manifest_sha256=expected,
+            policy=policy(),
+            acceptance_history=link,
+        )
+
+
+def test_cli_refuses_receipt_history_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    expected = write_manifest(manifest)
+    output = tmp_path / "evidence.json"
+    monkeypatch.setattr(
+        "src.runtime_eval_attestation.subprocess.run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+    arguments = [
+        str(manifest),
+        "--expected-manifest-sha256",
+        expected,
+        "--repository",
+        REPOSITORY,
+        "--signer-workflow",
+        SIGNER_WORKFLOW,
+        "--signer-digest",
+        SIGNER_DIGEST,
+        "--source-ref",
+        SOURCE_REF,
+        "--output",
+        str(output),
+        "--acceptance-history",
+        str(output),
+    ]
+
+    assert main(arguments) == 2
+    assert not output.exists()
