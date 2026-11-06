@@ -234,12 +234,21 @@ python tools/verify_runtime_benchmark_attestation.py runtime-benchmark-manifest.
   --signer-workflow .github/workflows/attest-runtime-benchmark.yml \
   --signer-digest "$SIGNER_WORKFLOW_COMMIT_SHA" \
   --source-ref refs/heads/main \
+  --acceptance-history runtime-benchmark-acceptance-history.jsonl \
   --output runtime-benchmark-attestation-receipt.json
 ```
 
 For an air-gapped decision, also supply `--bundle`, `--trusted-root` and the immutable numeric
 `--repository-id`. Offline verification rejects every attestation result whose certificate does not
 match that repository ID.
+
+When `--acceptance-history` is supplied, the verifier appends only after provenance verification
+succeeds. The owner-only JSONL log binds each privacy-reduced receipt to the previous entry and
+serializes concurrent writers with an advisory file lock. Replaying the same receipt is idempotent;
+deletion, reordering, field substitution, non-canonical JSON, truncated writes, symlinks, hard links,
+and group/world-readable history files fail closed. Keep this bounded log on independently retained
+storage to make whole-file rollback detectable: the local hash chain alone cannot prevent a host
+that controls the file from replacing the complete history.
 
 The producer boundary is `.github/workflows/attest-runtime-benchmark.yml`. It can run only from a
 default-branch push, uses the protected `runtime-benchmark-signer` Environment, and is the only job
@@ -260,8 +269,8 @@ retained for 30 days.
 This controlled suite proves deterministic runtime-policy behavior, not LLM answer quality,
 benchmark representativeness, runner attestation, or model performance. The HMAC key remains a
 shared secret, and no live attestation is claimed until the workflow runs after review on the
-protected default branch. The next hardening step is key-status rotation and an independently
-retained history of accepted manifest commitments.
+protected default branch. The next hardening step is a signed key-status rotation policy for the
+manifest HMAC key and an external checkpoint for the accepted-history head digest.
 
 ## Example
 
@@ -366,6 +375,7 @@ docs/authoritative-reconciliation.md  provider contract, deadlines and trust bou
 src/runtime_eval.py            trace metrics and bounded aggregate release gate
 src/runtime_eval_manifest.py   authenticated benchmark and release provenance manifest
 src/runtime_eval_attestation.py  independent GitHub attestation intake boundary
+src/runtime_eval_attestation_history.py  locked hash-chained accepted-manifest history
 src/reviewed_runtime_benchmark.py  deterministic governed-runtime release scenario suite
 tools/sign_reviewed_runtime_benchmark.py  protected signer and canonical manifest CLI
 tools/verify_runtime_benchmark_attestation.py  attestation verification and receipt CLI

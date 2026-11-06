@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from src.runtime_eval_attestation_history import append_attestation_acceptance
 from src.runtime_eval_manifest import (
     MAX_MANIFEST_BYTES,
     RuntimeBenchmarkManifest,
@@ -88,6 +89,7 @@ def verify_runtime_benchmark_attestation(
     repository_id: str | None = None,
     gh_executable: str = "gh",
     timeout_seconds: int = 30,
+    acceptance_history: Path | None = None,
 ) -> dict[str, Any]:
     """Verify one immutable manifest snapshot and its GitHub artifact provenance."""
     if not isinstance(policy, RuntimeBenchmarkAttestationPolicy):
@@ -174,6 +176,8 @@ def verify_runtime_benchmark_attestation(
         "verification_mode": "offline" if offline else "online",
     }
     receipt["evidence_sha256"] = hashlib.sha256(_canonical(receipt)).hexdigest()
+    if acceptance_history is not None:
+        append_attestation_acceptance(acceptance_history, receipt)
     return receipt
 
 
