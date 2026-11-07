@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from src.runtime_eval_attestation_history import load_attestation_history
+from src.runtime_eval_checkpoint_key_status import (
+    RuntimeBenchmarkCheckpointKeyStatusError,
+    verify_checkpoint_key_status,
+)
 
 CHECKPOINT_SCHEMA = "runtime-benchmark-attestation-history-checkpoint/v1"
 VERIFICATION_SCHEMA = "runtime-benchmark-attestation-history-checkpoint-verification/v1"
@@ -91,13 +95,20 @@ def create_attestation_history_checkpoint(
 def verify_attestation_history_checkpoint(
     history_path: Path,
     envelope: object,
+    key_status_envelope: object,
     *,
     expected_source_revision: str,
     expected_checkpoint_key_id: str,
     expected_public_key_sha256: str,
+    expected_status_generation: int,
+    expected_previous_status_sha256: str,
+    expected_status_authority_key_id: str,
+    expected_status_authority_public_key_sha256: str,
+    verification_time: str,
     signature_verifier: SignatureVerifier,
+    status_signature_verifier: SignatureVerifier,
 ) -> dict[str, Any]:
-    """Verify an independently retained checkpoint against the current history head."""
+    """Verify active signer status, then bind a checkpoint to the current history head."""
     if not isinstance(envelope, dict) or set(envelope) != _TOP_LEVEL_FIELDS:
         raise RuntimeBenchmarkCheckpointError("checkpoint_envelope_schema_invalid")
     checkpoint = envelope.get("checkpoint")
@@ -133,6 +144,20 @@ def verify_attestation_history_checkpoint(
         raise RuntimeBenchmarkCheckpointError("checkpoint_verification_unavailable") from exc
     if valid is not True:
         raise RuntimeBenchmarkCheckpointError("checkpoint_signature_invalid")
+    try:
+        status_receipt = verify_checkpoint_key_status(
+            key_status_envelope,
+            expected_checkpoint_key_id=expected_checkpoint_key_id,
+            expected_checkpoint_public_key_sha256=key_digest,
+            expected_generation=expected_status_generation,
+            expected_previous_status_sha256=expected_previous_status_sha256,
+            expected_status_authority_key_id=expected_status_authority_key_id,
+            expected_status_authority_public_key_sha256=(expected_status_authority_public_key_sha256),
+            verification_time=verification_time,
+            signature_verifier=status_signature_verifier,
+        )
+    except RuntimeBenchmarkCheckpointKeyStatusError as exc:
+        raise RuntimeBenchmarkCheckpointError(exc.code) from exc
     expected = _checkpoint_claims(
         history_path,
         source_revision=expected_source_revision,
@@ -142,6 +167,7 @@ def verify_attestation_history_checkpoint(
     if checkpoint != expected:
         raise RuntimeBenchmarkCheckpointError("checkpoint_history_mismatch")
     receipt: dict[str, Any] = {
+        **status_receipt,
         "attestation_policy_sha256": checkpoint["attestation_policy_sha256"],
         "checkpoint_key_id_sha256": hashlib.sha256(expected_checkpoint_key_id.encode("ascii")).hexdigest(),
         "checkpoint_key_sha256": key_digest,
