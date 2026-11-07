@@ -173,6 +173,22 @@ signer or verifier crosses the trust boundary. Rates are exact descriptive aggre
 does not claim statistical independence, uncertainty bounds or representativeness of the supplied
 benchmark set.
 
+Aggregate rates alone can hide a weakened safety suite: for example, removing the only
+approval-withholding case may still leave every threshold green. `src/runtime_eval_safety_coverage.py`
+therefore audits prespecified pointers to concrete trace results before the reviewed benchmark can
+be signed. The current contract requires independent witnesses for ordinary success, normalized
+tool failure, approval withholding, approved execution, explicit policy denial, idempotent replay,
+step-budget enforcement, and unknown-tool denial. Each witness must match its declared action
+status, policy decision, and trace stop reason; missing, duplicated, out-of-range, or relabeled
+probes fail closed. The scenario-suite commitment binds both the coverage policy and ordered probe
+set. The emitted audit receipt contains only boundary counts and cryptographic commitments—not
+tasks, tools, arguments, outputs, errors, policy reasons, or idempotency keys.
+
+This is a deterministic scenario-coverage contract, not proof that the scenarios represent
+production traffic or that every unsafe implementation is detected. Keep the probes under code
+review, add a new witness when a safety boundary is introduced, and pair this structural check
+with production telemetry and adversarial evaluation.
+
 `src/runtime_eval_manifest.py` can recompute a report from runtime traces and bind it to the
 reviewed scenario-suite digest, privacy-reduced evaluation evidence, runtime version and source
 revision before a release gate consumes it:
@@ -415,6 +431,7 @@ docs/retry-authorization.md    signed no-commit decisions and retry threat model
 docs/ledger-observability.md    key-free gauges, durable counters and alerting boundary
 docs/authoritative-reconciliation.md  provider contract, deadlines and trust boundary
 src/runtime_eval.py            trace metrics and bounded aggregate release gate
+src/runtime_eval_safety_coverage.py  prespecified execution-boundary witness audit
 src/runtime_eval_manifest.py   authenticated benchmark and release provenance manifest
 src/runtime_eval_attestation.py  independent GitHub attestation intake boundary
 src/runtime_eval_attestation_history.py  locked hash-chained accepted-manifest history

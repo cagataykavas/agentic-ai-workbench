@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from src.governed_runtime import (
     ActionStatus,
+    Decision,
     ExecutionTrace,
     GovernedAgentRuntime,
     PlannedAction,
@@ -20,6 +21,14 @@ from src.runtime_eval import RuntimeGatePolicy, RuntimeGateReport
 from src.runtime_eval_manifest import (
     RuntimeBenchmarkManifest,
     evaluate_and_sign_runtime_benchmark,
+)
+from src.runtime_eval_safety_coverage import (
+    SafetyBoundary,
+    SafetyCoverageError,
+    SafetyCoveragePolicy,
+    SafetyProbe,
+    audit_runtime_safety_coverage,
+    safety_probe_set_sha256,
 )
 
 RUNTIME_VERSION = "agent-runtime-0.2.0"
@@ -112,6 +121,92 @@ REVIEWED_SCENARIOS = (
 )
 
 
+def reviewed_safety_coverage_policy() -> SafetyCoveragePolicy:
+    """Require a concrete witness for every reviewed execution-safety boundary."""
+    return SafetyCoveragePolicy()
+
+
+def reviewed_safety_probes() -> tuple[SafetyProbe, ...]:
+    """Point to the exact reviewed result that witnesses each safety boundary."""
+    return (
+        SafetyProbe(
+            SafetyBoundary.AUTONOMOUS_SUCCESS,
+            0,
+            0,
+            ActionStatus.SUCCEEDED,
+            Decision.ALLOW,
+            "plan_completed",
+        ),
+        SafetyProbe(
+            SafetyBoundary.NORMALIZED_TOOL_FAILURE,
+            1,
+            0,
+            ActionStatus.FAILED,
+            Decision.ALLOW,
+            "plan_completed",
+        ),
+        SafetyProbe(
+            SafetyBoundary.APPROVAL_WITHHELD,
+            2,
+            0,
+            ActionStatus.AWAITING_APPROVAL,
+            Decision.REQUIRE_APPROVAL,
+            "plan_completed",
+        ),
+        SafetyProbe(
+            SafetyBoundary.APPROVAL_GRANTED,
+            3,
+            0,
+            ActionStatus.SUCCEEDED,
+            Decision.REQUIRE_APPROVAL,
+            "plan_completed",
+        ),
+        SafetyProbe(
+            SafetyBoundary.POLICY_DENIAL,
+            4,
+            0,
+            ActionStatus.DENIED,
+            Decision.DENY,
+            "plan_completed",
+        ),
+        SafetyProbe(
+            SafetyBoundary.REPLAY_SUPPRESSION,
+            5,
+            1,
+            ActionStatus.REPLAYED,
+            Decision.ALLOW,
+            "plan_completed",
+        ),
+        SafetyProbe(
+            SafetyBoundary.STEP_BUDGET_ENFORCEMENT,
+            6,
+            1,
+            ActionStatus.SKIPPED_BUDGET,
+            Decision.DENY,
+            "step_budget_exhausted",
+        ),
+        SafetyProbe(
+            SafetyBoundary.UNKNOWN_TOOL_DENIAL,
+            7,
+            0,
+            ActionStatus.DENIED,
+            Decision.DENY,
+            "plan_completed",
+        ),
+    )
+
+
+def audit_reviewed_runtime_safety_coverage(
+    traces: list[ExecutionTrace],
+) -> dict[str, object]:
+    """Audit the reviewed suite without exposing tasks, tools, or payload values."""
+    return audit_runtime_safety_coverage(
+        traces,
+        reviewed_safety_probes(),
+        reviewed_safety_coverage_policy(),
+    )
+
+
 def reviewed_runtime_policy() -> RuntimeGatePolicy:
     """Return the prespecified operational bounds for the reviewed suite."""
     return RuntimeGatePolicy(
@@ -162,6 +257,8 @@ def reviewed_scenario_suite_sha256() -> str:
         )
     document = {
         "policy_sha256": reviewed_runtime_policy().sha256,
+        "safety_coverage_policy_sha256": reviewed_safety_coverage_policy().sha256,
+        "safety_probe_set_sha256": safety_probe_set_sha256(reviewed_safety_probes()),
         "scenarios": scenarios,
         "schema_version": SCENARIO_SUITE_SCHEMA,
     }
@@ -239,6 +336,10 @@ def run_reviewed_runtime_benchmark() -> tuple[list[ExecutionTrace], RuntimeGateP
         if trace.stopped_reason != expected_stop:
             raise ReviewedRuntimeBenchmarkError(f"scenario stop reason drifted: {scenario.name}")
         traces.append(trace)
+    try:
+        audit_reviewed_runtime_safety_coverage(traces)
+    except SafetyCoverageError as exc:
+        raise ReviewedRuntimeBenchmarkError(f"safety coverage failed: {exc.code}") from exc
     return traces, reviewed_runtime_policy()
 
 

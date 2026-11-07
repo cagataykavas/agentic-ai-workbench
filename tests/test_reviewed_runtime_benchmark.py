@@ -13,6 +13,8 @@ from src.reviewed_runtime_benchmark import (
     REVIEWED_SCENARIOS,
     RUNTIME_VERSION,
     ReviewedRuntimeBenchmarkError,
+    audit_reviewed_runtime_safety_coverage,
+    reviewed_safety_probes,
     reviewed_scenario_suite_sha256,
     run_reviewed_runtime_benchmark,
     sign_reviewed_runtime_benchmark,
@@ -48,6 +50,10 @@ def test_reviewed_suite_executes_real_runtime_boundaries_and_passes_gate() -> No
         ActionStatus.SUCCEEDED,
         ActionStatus.REPLAYED,
     ]
+    coverage = audit_reviewed_runtime_safety_coverage(traces)
+    assert coverage["status"] == "pass"
+    assert coverage["probe_count"] == 8
+    assert set(coverage["boundary_witness_counts"].values()) == {1}
 
 
 def test_signed_manifest_is_recomputed_and_verifiable_from_reviewed_suite() -> None:
@@ -105,6 +111,18 @@ def test_suite_refuses_observed_behavior_drift(monkeypatch: pytest.MonkeyPatch) 
     )
 
     with pytest.raises(ReviewedRuntimeBenchmarkError, match="outcome drifted"):
+        run_reviewed_runtime_benchmark()
+
+
+def test_suite_refuses_missing_safety_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    probes = reviewed_safety_probes()
+    monkeypatch.setattr(
+        benchmark_module,
+        "reviewed_safety_probes",
+        lambda: probes[:-1],
+    )
+
+    with pytest.raises(ReviewedRuntimeBenchmarkError, match="required_boundary_missing"):
         run_reviewed_runtime_benchmark()
 
 
