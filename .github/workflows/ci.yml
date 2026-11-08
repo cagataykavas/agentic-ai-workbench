@@ -33,6 +33,18 @@ jobs:
         run: ruff check src tools tests human_agent_collaboration.py workflow_experiment.py
       - name: Pytest
         run: pytest -q
+      - name: Run reviewed runtime safety mutation campaign
+        run: |
+          set -o pipefail
+          python -m src.runtime_eval_mutation_campaign \
+            | tee "${RUNNER_TEMP}/runtime-safety-mutation-campaign.json"
+      - name: Archive mutation campaign receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-safety-mutation-campaign-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/runtime-safety-mutation-campaign.json
+          if-no-files-found: error
+          retention-days: 14
       - name: Legacy deterministic demo smoke
         run: python -m src.demo
       - name: Governed runtime import smoke

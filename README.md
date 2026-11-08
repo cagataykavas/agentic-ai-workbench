@@ -189,6 +189,22 @@ production traffic or that every unsafe implementation is detected. Keep the pro
 review, add a new witness when a safety boundary is introduced, and pair this structural check
 with production telemetry and adversarial evaluation.
 
+`src/runtime_eval_mutation_campaign.py` tests whether those witnesses are sensitive to real
+single-fault runtime variants rather than merely present. It rebuilds the reviewed registry for
+each mutant and independently masks the controlled tool failure or bypasses approval enforcement, explicit
+denial, replay suppression, the step budget, or unknown-tool denial. Every variant executes the
+ordinary governed runtime; the campaign fails unless the prespecified probe for that exact boundary
+detects the drift. Its deterministic receipt contains only mutant/boundary commitments and counts,
+not scenario tasks, tool names, payloads, errors, policy reasons, or idempotency keys.
+
+```bash
+python -m src.runtime_eval_mutation_campaign
+```
+
+Mutation score here is a deterministic contract over six declared fault models, not a statistical
+estimate of safety or exhaustive mutation analysis. New execution controls need reviewed mutants,
+and production shadow traces still need a separate privacy and sampling policy.
+
 `src/runtime_eval_manifest.py` can recompute a report from runtime traces and bind it to the
 reviewed scenario-suite digest, privacy-reduced evaluation evidence, runtime version and source
 revision before a release gate consumes it:
@@ -432,6 +448,7 @@ docs/ledger-observability.md    key-free gauges, durable counters and alerting b
 docs/authoritative-reconciliation.md  provider contract, deadlines and trust boundary
 src/runtime_eval.py            trace metrics and bounded aggregate release gate
 src/runtime_eval_safety_coverage.py  prespecified execution-boundary witness audit
+src/runtime_eval_mutation_campaign.py  real-runtime single-fault safety mutation campaign
 src/runtime_eval_manifest.py   authenticated benchmark and release provenance manifest
 src/runtime_eval_attestation.py  independent GitHub attestation intake boundary
 src/runtime_eval_attestation_history.py  locked hash-chained accepted-manifest history
