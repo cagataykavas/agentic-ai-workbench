@@ -272,7 +272,8 @@ def reviewed_scenario_suite_sha256() -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _registry() -> ToolRegistry:
+def build_reviewed_runtime_registry() -> ToolRegistry:
+    """Build a fresh registry for one reviewed scenario execution."""
     registry = ToolRegistry()
     registry.register(
         ToolSpec(
@@ -316,7 +317,7 @@ def run_reviewed_runtime_benchmark() -> tuple[list[ExecutionTrace], RuntimeGateP
     traces = []
     for scenario in REVIEWED_SCENARIOS:
         runtime = GovernedAgentRuntime(
-            _registry(),
+            build_reviewed_runtime_registry(),
             policy=ToolPolicy(PolicyConfig(denied_tools=frozenset({"denied"}))),
             max_steps=scenario.max_steps,
         )
