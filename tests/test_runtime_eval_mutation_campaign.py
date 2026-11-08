@@ -7,8 +7,8 @@ from dataclasses import replace
 import pytest
 
 from src.runtime_eval_mutation_campaign import (
-    MUTATION_CAMPAIGN_SCHEMA,
     MUTANT_BOUNDARIES,
+    MUTATION_CAMPAIGN_SCHEMA,
     SUPPORTED_MUTANTS,
     MutationCampaignError,
     evaluate_runtime_safety_mutants,
